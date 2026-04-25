@@ -78,21 +78,33 @@ test("guards retryLastTurn fallback with explicit safe path and no triggerTurn m
   assert.equal(source.includes("triggerTurn"), false, "sendUserMessage no longer accepts triggerTurn");
 });
 
-test("adds schema-overload continuation path with in-place retryLastTurn", () => {
-  assert.match(source, /SCHEMA_OVERLOAD_RE/);
-  assert.match(source, /function classifyAsSchemaOverload\(/);
-  assert.match(source, /function handleSchemaOverload\(/);
-  assert.match(source, /schema_overload_retry/);
-  assert.match(source, /Core schema-overload cap hit\. In-place retryLastTurn/);
-  assert.match(source, /if \(classifyAsSchemaOverload\(combinedLog\)\)/);
+test("hijacks schema-overload at agent_end to force in-session transient retry path", () => {
+  assert.match(source, /function getAgentEndErrorMessage\(/);
+  assert.match(source, /pi\.on\("agent_end", \(event: \{ messages: unknown\[] \}\) => \{/);
+  assert.match(source, /if \(!classifyAsSchemaOverload\(errorMsg\.toLowerCase\(\)\)\) return;/);
+  assert.match(source, /if \(!lastMsg \|\| lastMsg\.stopReason !== "error"\) return;/);
+  assert.match(source, /fetch failed \(schema-overload-transient-hijack\)/);
+  assert.match(source, /lastMsg\.errorMessage = hijackedError;/);
+  assert.match(source, /logLifecycle\("agent_end_schema_overload_hijack"/);
 });
 
-test("keeps stop handling simple: no custom-step soft-continue branch", () => {
-  assert.equal(source.includes("CUSTOM_STEP_SOFT_CONTINUE_RE"), false);
-  assert.equal(source.includes("handleSoftContinueForCustomStep"), false);
-  assert.equal(source.includes("stop_cancelled_reclassified"), false);
-  assert.match(source, /TOOL_INVOCATION_PASSTHROUGH_RE/);
-  assert.match(source, /stop_passthrough_tool_invocation/);
+test("aborts a turn after 2 tool errors and auto-resumes on cancelled stop", () => {
+  assert.match(source, /const MAX_TOOL_ERRORS_BEFORE_ABORT = 2/);
+  assert.match(source, /toolErrorsInCurrentTurn: number/);
+  assert.match(source, /toolErrorGuardAbortArmed: boolean/);
+
+  assert.match(source, /pi\.on\("turn_start", \(\) => \{/);
+  assert.match(source, /pi\.on\("tool_execution_end", \(event: \{ isError\?: boolean; toolName\?: string \}, ctx: ExtensionContext\) => \{/);
+  assert.match(source, /state\.toolErrorsInCurrentTurn \+= 1/);
+  assert.match(source, /if \(state\.toolErrorsInCurrentTurn < MAX_TOOL_ERRORS_BEFORE_ABORT\)/);
+  assert.match(source, /state\.toolErrorGuardAbortArmed = true/);
+  assert.match(source, /ctx\.abort\(\)/);
+  assert.match(source, /logLifecycle\("tool_error_guard_abort_requested"/);
+
+  assert.match(source, /if \(reason === "cancelled"\) \{/);
+  assert.match(source, /if \(state\.toolErrorGuardAbortArmed\) \{/);
+  assert.match(source, /phase: "tool_error_guard_resume"/);
+  assert.match(source, /safeSendUserMessage\(pi, resumeCommand/);
 });
 
 test("forbids command-recognition, auto-lock and mode-branch heuristics", () => {

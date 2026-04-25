@@ -31,6 +31,8 @@ interface RuntimeState {
   schemaOverloadRetries: number;
   isFixingType3: boolean;
   retryTimers: Map<ManagedRetryType, ScheduledRetryTimer>;
+  toolErrorsInCurrentTurn: number;
+  toolErrorGuardAbortArmed: boolean;
 }
 
 const PLUGIN = "gsd-auto-continue";
@@ -49,6 +51,7 @@ const SCHEMA_OVERLOAD_MAX_RETRIES =
   Number.isFinite(SCHEMA_OVERLOAD_MAX_RETRIES_RAW) && SCHEMA_OVERLOAD_MAX_RETRIES_RAW > 0
     ? SCHEMA_OVERLOAD_MAX_RETRIES_RAW
     : 0;
+const MAX_TOOL_ERRORS_BEFORE_ABORT = 2;
 
 const ESC_PAUSE_BANNER_RE = /\b(?:auto|step)-mode paused \(escape\)\b/i;
 
@@ -64,6 +67,8 @@ const TOOL_INVOCATION_PASSTHROUGH_RE =
 const SCHEMA_OVERLOAD_RE =
   /schema overload|consecutive tool validation failures exceeded cap|consecutive turns with all tool calls failing/i;
 
+const AUTO_PAUSE_CONTEXT_RE = /auto-mode paused|paused \(escape\)|provider error/i;
+
 const NETWORK_RE = /network|timeout|econnreset|socket|fetch failed|stream idle/i;
 
 const state: RuntimeState = {
@@ -74,6 +79,8 @@ const state: RuntimeState = {
   schemaOverloadRetries: 0,
   isFixingType3: false,
   retryTimers: new Map(),
+  toolErrorsInCurrentTurn: 0,
+  toolErrorGuardAbortArmed: false,
 };
 
 type UiNotifyLevel = "info" | "warning" | "error" | "success";
@@ -319,9 +326,12 @@ function scheduleRetryTimer(
 }
 
 function standDown(reason: string, pi: ExtensionAPI, notify = false): void {
-  const wasRecovering = state.isFixingType3 || state.retryTimers.size > 0;
+  const wasRecovering =
+    state.isFixingType3 || state.retryTimers.size > 0 || state.toolErrorGuardAbortArmed || state.toolErrorsInCurrentTurn > 0;
 
   state.isFixingType3 = false;
+  state.toolErrorsInCurrentTurn = 0;
+  state.toolErrorGuardAbortArmed = false;
   cancelAllRetryTimers(`${reason}:stand_down`);
   state.lastNotifications = [];
   resetRetries(`${reason}:stand_down`, true);
@@ -425,6 +435,26 @@ function getStopErrorMessage(event: StopEvent): string {
   return typeof maybeError === "string" ? maybeError : "";
 }
 
+function getAgentEndErrorMessage(event: { messages: unknown[] }): string {
+  const messages = Array.isArray(event.messages) ? event.messages : [];
+  const lastMsg = messages[messages.length - 1] as {
+    errorMessage?: unknown;
+    content?: Array<{ type?: unknown; text?: unknown }>;
+  } | undefined;
+
+  const raw = typeof lastMsg?.errorMessage === "string" ? lastMsg.errorMessage : "";
+  if (raw.trim()) return raw;
+
+  const blocks = Array.isArray(lastMsg?.content) ? lastMsg.content : [];
+  for (const block of blocks) {
+    if (block && block.type === "text" && typeof block.text === "string" && block.text.trim()) {
+      return block.text;
+    }
+  }
+
+  return "";
+}
+
 function classifyAsType2(combinedLog: string): boolean {
   return TYPE2_RE.test(combinedLog);
 }
@@ -473,6 +503,9 @@ function handleSchemaOverload(piApi: ExtensionAPI, stopReason: StopEvent["reason
     display: true,
   });
 
+  const pausedAutoLikely = AUTO_PAUSE_CONTEXT_RE.test(combinedLog);
+  const resumeCommand = getResumeCommand();
+
   scheduleRetryTimer(
     "type1",
     SCHEMA_OVERLOAD_RETRY_DELAY_MS,
@@ -483,14 +516,26 @@ function handleSchemaOverload(piApi: ExtensionAPI, stopReason: StopEvent["reason
       detail: combinedLog || stopReason,
     },
     () => {
-      if (
-        safeRetryLastTurn(piApi, {
-          phase: "schema_overload_retry",
+      const retryCalled = safeRetryLastTurn(piApi, {
+        phase: "schema_overload_retry",
+        retryType: "type1",
+        attempt: nextAttempt,
+        reason: "schema_overload",
+      });
+
+      if (pausedAutoLikely) {
+        safeSendUserMessage(piApi, resumeCommand, {
+          phase: "schema_overload_resume_auto",
           retryType: "type1",
           attempt: nextAttempt,
-          reason: "schema_overload",
-        })
-      ) {
+          reason: retryCalled
+            ? "schema_overload:paused_auto_after_retry_last_turn"
+            : "schema_overload:paused_auto_after_retry_last_turn_failed",
+        });
+        return;
+      }
+
+      if (retryCalled) {
         return;
       }
 
@@ -786,6 +831,88 @@ export default async function registerExtension(pi: ExtensionAPI) {
     // Reserved hook for future pre-turn recovery context wiring.
   });
 
+  pi.on("agent_end", (event: { messages: unknown[] }) => {
+    const errorMsg = getAgentEndErrorMessage(event);
+    if (!errorMsg) return;
+    if (!classifyAsSchemaOverload(errorMsg.toLowerCase())) return;
+
+    const messages = Array.isArray(event.messages) ? event.messages : [];
+    const lastMsg = messages[messages.length - 1] as {
+      stopReason?: unknown;
+      errorMessage?: unknown;
+    } | undefined;
+
+    if (!lastMsg || lastMsg.stopReason !== "error") return;
+
+    const rawError = typeof lastMsg.errorMessage === "string" ? lastMsg.errorMessage : "";
+    if (NETWORK_RE.test(rawError)) return;
+
+    const hijackedError = rawError
+      ? `${rawError} | fetch failed (schema-overload-transient-hijack)`
+      : "fetch failed (schema-overload-transient-hijack)";
+
+    lastMsg.errorMessage = hijackedError;
+
+    logLifecycle("agent_end_schema_overload_hijack", {
+      reason: "schema_overload",
+      detail: hijackedError,
+    });
+  });
+
+  pi.on("turn_start", () => {
+    state.toolErrorsInCurrentTurn = 0;
+    state.toolErrorGuardAbortArmed = false;
+  });
+
+  pi.on("tool_execution_end", (event: { isError?: boolean; toolName?: string }, ctx: ExtensionContext) => {
+    if (state.isFixingType3) return;
+    if (!event?.isError) return;
+
+    state.toolErrorsInCurrentTurn += 1;
+
+    logLifecycle("tool_error_guard_count", {
+      retryType: "type1",
+      attempt: state.toolErrorsInCurrentTurn,
+      reason: "tool_error",
+      detail: String(event.toolName || "unknown"),
+    });
+
+    if (state.toolErrorsInCurrentTurn < MAX_TOOL_ERRORS_BEFORE_ABORT) {
+      return;
+    }
+
+    if (state.toolErrorGuardAbortArmed) {
+      return;
+    }
+
+    state.toolErrorGuardAbortArmed = true;
+
+    pi.sendMessage({
+      customType: "system",
+      content: "⚠️ [AutoContinue] 2 tool errors in this turn. Aborting turn early to avoid schema-overload cap, then resuming auto-mode.",
+      display: true,
+    });
+
+    logLifecycle("tool_error_guard_abort_requested", {
+      retryType: "type1",
+      attempt: state.toolErrorsInCurrentTurn,
+      reason: "tool_error_guard",
+      detail: "ctx.abort",
+    });
+
+    try {
+      ctx.abort();
+    } catch (error) {
+      logLifecycle("tool_error_guard_abort_failed", {
+        retryType: "type1",
+        attempt: state.toolErrorsInCurrentTurn,
+        reason: "tool_error_guard",
+        detail: normalizeError(error),
+      });
+      state.toolErrorGuardAbortArmed = false;
+    }
+  });
+
   pi.on("input", (event: InputEvent) => {
     if (event.source !== "interactive") return;
 
@@ -832,6 +959,17 @@ export default async function registerExtension(pi: ExtensionAPI) {
       reason,
       detail: combinedLog || "(empty)",
     });
+
+    if (state.toolErrorGuardAbortArmed && reason !== "cancelled") {
+      logLifecycle("tool_error_guard_abort_cleared", {
+        retryType: "type1",
+        attempt: state.toolErrorsInCurrentTurn,
+        reason,
+        detail: "non_cancelled_stop",
+      });
+      state.toolErrorGuardAbortArmed = false;
+      state.toolErrorsInCurrentTurn = 0;
+    }
 
     // Type 3 修复回合结束后自动续跑。
     if (state.isFixingType3 && reason === "completed") {
@@ -880,6 +1018,41 @@ export default async function registerExtension(pi: ExtensionAPI) {
     }
 
     if (reason === "cancelled") {
+      if (state.toolErrorGuardAbortArmed) {
+        const resumeCommand = getResumeCommand();
+        const guardedAttempts = state.toolErrorsInCurrentTurn;
+
+        state.toolErrorGuardAbortArmed = false;
+        state.toolErrorsInCurrentTurn = 0;
+
+        logLifecycle("tool_error_guard_abort_observed", {
+          retryType: "type1",
+          attempt: guardedAttempts,
+          reason: "tool_error_guard",
+          detail: "stop:cancelled",
+        });
+
+        scheduleRetryTimer(
+          "type1",
+          300,
+          {
+            phase: "tool_error_guard_resume",
+            attempt: 0,
+            reason: "tool_error_guard",
+            detail: resumeCommand,
+          },
+          () => {
+            safeSendUserMessage(pi, resumeCommand, {
+              phase: "tool_error_guard_resume",
+              retryType: "type1",
+              attempt: 0,
+              reason: "tool_error_guard",
+            });
+          },
+        );
+        return;
+      }
+
       standDown("stop:cancelled", pi, true);
       return;
     }
