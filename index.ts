@@ -30,6 +30,7 @@ interface RuntimeState {
   type1Retries: number;
   type2Retries: number;
   type3Retries: number;
+  schemaOverloadRetries: number;
   isFixingType3: boolean;
   retryTimers: Map<ManagedRetryType, ScheduledRetryTimer>;
 }
@@ -41,6 +42,15 @@ const RETRY_LIMITS = {
   type2: 5,
   type3: 3,
 } as const;
+const SCHEMA_OVERLOAD_RETRY_DELAY_MS = 1500;
+const SCHEMA_OVERLOAD_MAX_RETRIES_RAW = Number.parseInt(
+  process.env.GSD_AUTO_CONTINUE_SCHEMA_OVERLOAD_MAX_RETRIES || "0",
+  10,
+);
+const SCHEMA_OVERLOAD_MAX_RETRIES =
+  Number.isFinite(SCHEMA_OVERLOAD_MAX_RETRIES_RAW) && SCHEMA_OVERLOAD_MAX_RETRIES_RAW > 0
+    ? SCHEMA_OVERLOAD_MAX_RETRIES_RAW
+    : 0;
 
 const AUTO_MODE_STARTED_RE = /\bauto-mode (started|resumed)\b/i;
 const STEP_MODE_STARTED_RE = /\bstep-mode (started|resumed)\b/i;
@@ -55,6 +65,9 @@ const TYPE2_RE =
 const TOOL_INVOCATION_PASSTHROUGH_RE =
   /^(?!.*(?:exceeded cap|consecutive)).*(?:tool invocation failed|structured argument generation failed|validation failed for tool)/i;
 
+const SCHEMA_OVERLOAD_RE =
+  /schema overload|consecutive tool validation failures exceeded cap|consecutive turns with all tool calls failing/i;
+
 const NETWORK_RE = /network|timeout|econnreset|socket|fetch failed|stream idle/i;
 
 const state: RuntimeState = {
@@ -63,6 +76,7 @@ const state: RuntimeState = {
   type1Retries: 0,
   type2Retries: 0,
   type3Retries: 0,
+  schemaOverloadRetries: 0,
   isFixingType3: false,
   retryTimers: new Map(),
 };
@@ -172,10 +186,22 @@ function resetRetryCount(retryType: ManagedRetryType, reason: string, forceLog =
   });
 }
 
+function resetSchemaOverloadRetries(reason: string, forceLog = false): void {
+  if (state.schemaOverloadRetries === 0 && !forceLog) return;
+
+  state.schemaOverloadRetries = 0;
+  logLifecycle("schema_overload_reset", {
+    retryType: "type1",
+    attempt: 0,
+    reason,
+  });
+}
+
 function resetRetries(reason: string, forceLog = false): void {
   resetRetryCount("type1", reason, forceLog);
   resetRetryCount("type2", reason, forceLog);
   resetRetryCount("type3", reason, forceLog);
+  resetSchemaOverloadRetries(reason, forceLog);
 }
 
 function rememberNotification(message: string): void {
@@ -427,6 +453,85 @@ function classifyAsType2(combinedLog: string): boolean {
   return TYPE2_RE.test(combinedLog);
 }
 
+function classifyAsSchemaOverload(combinedLog: string): boolean {
+  return SCHEMA_OVERLOAD_RE.test(combinedLog);
+}
+
+function handleSchemaOverload(piApi: ExtensionAPI, stopReason: StopEvent["reason"], combinedLog: string): void {
+  cancelRetryTimersExcept("type1", "schema_overload_enter");
+  resetRetryCount("type1", "schema_overload_enter");
+  resetRetryCount("type2", "schema_overload_enter");
+  resetRetryCount("type3", "schema_overload_enter");
+
+  if (state.retryTimers.has("type1")) {
+    logLifecycle("schema_overload_retry_pending", {
+      retryType: "type1",
+      attempt: state.schemaOverloadRetries,
+      reason: stopReason,
+      detail: "timer_already_scheduled",
+    });
+    return;
+  }
+
+  const nextAttempt = state.schemaOverloadRetries + 1;
+  const unlimitedRetries = SCHEMA_OVERLOAD_MAX_RETRIES === 0;
+
+  if (!unlimitedRetries && nextAttempt > SCHEMA_OVERLOAD_MAX_RETRIES) {
+    piApi.sendMessage({
+      customType: "system",
+      content: `❌ [AutoContinue] Schema-overload retry exhausted (${SCHEMA_OVERLOAD_MAX_RETRIES}/${SCHEMA_OVERLOAD_MAX_RETRIES}). Manual intervention required.`,
+      display: true,
+    });
+    standDown("schema_overload_exhausted", piApi, false);
+    return;
+  }
+
+  state.schemaOverloadRetries = nextAttempt;
+  const attemptLabel = unlimitedRetries
+    ? `${nextAttempt}`
+    : `${nextAttempt}/${SCHEMA_OVERLOAD_MAX_RETRIES}`;
+
+  piApi.sendMessage({
+    customType: "system",
+    content: `♻️ [AutoContinue] Core schema-overload cap hit. In-place retryLastTurn in ${SCHEMA_OVERLOAD_RETRY_DELAY_MS / 1000}s (Attempt ${attemptLabel})...`,
+    display: true,
+  });
+
+  scheduleRetryTimer(
+    "type1",
+    SCHEMA_OVERLOAD_RETRY_DELAY_MS,
+    {
+      phase: "schema_overload_retry",
+      attempt: nextAttempt,
+      reason: "schema_overload",
+      detail: combinedLog || stopReason,
+    },
+    () => {
+      if (
+        safeRetryLastTurn(piApi, {
+          phase: "schema_overload_retry",
+          retryType: "type1",
+          attempt: nextAttempt,
+          reason: "schema_overload",
+        })
+      ) {
+        return;
+      }
+
+      safeSendUserMessage(
+        piApi,
+        "Continue from the current context. The previous turn hit schema-overload due to tool argument validation failures. Regenerate valid tool arguments and proceed without restarting auto-mode.",
+        {
+          phase: "schema_overload_retry_fallback",
+          retryType: "type1",
+          attempt: nextAttempt,
+          reason: "schema_overload:retry_last_turn_fallback",
+        },
+      );
+    },
+  );
+}
+
 function handleType3(
   piApi: ExtensionAPI,
   stopReason: StopEvent["reason"],
@@ -442,6 +547,7 @@ function handleType3(
   cancelRetryTimersExcept("type3", `type3_enter:${triggerReason}`);
   resetRetryCount("type1", `type3_enter:${triggerReason}`);
   resetRetryCount("type2", `type3_enter:${triggerReason}`);
+  resetSchemaOverloadRetries(`type3_enter:${triggerReason}`);
 
   if (state.retryTimers.has("type3")) {
     logLifecycle("type3_retry_pending", {
@@ -504,6 +610,7 @@ function handleType2(piApi: ExtensionAPI, stopReason: StopEvent["reason"], combi
   cancelRetryTimersExcept("type2", "type2_enter");
   resetRetryCount("type1", "type2_enter");
   resetRetryCount("type3", "type2_enter");
+  resetSchemaOverloadRetries("type2_enter");
 
   if (state.retryTimers.has("type2")) {
     logLifecycle("type2_retry_pending", {
@@ -566,6 +673,7 @@ function handleType1(piApi: ExtensionAPI, stopReason: StopEvent["reason"], combi
   cancelRetryTimersExcept("type1", "type1_enter");
   resetRetryCount("type2", "type1_enter");
   resetRetryCount("type3", "type1_enter");
+  resetSchemaOverloadRetries("type1_enter");
 
   if (state.retryTimers.has("type1")) {
     logLifecycle("type1_retry_pending", {
@@ -681,6 +789,15 @@ export default async function registerExtension(pi: ExtensionAPI) {
       reason: `session_end:${event.reason}`,
       detail: event.sessionFile,
     });
+
+    if (event.reason === "programmatic" && (state.mode !== "inactive" || state.isFixingType3)) {
+      logLifecycle("session_end_mode_preserved", {
+        reason: "session_end:programmatic",
+        detail: "auto_mode_new_session_boundary",
+      });
+      return;
+    }
+
     standDown(`session_end:${event.reason}`, pi, false);
   });
 
@@ -689,8 +806,8 @@ export default async function registerExtension(pi: ExtensionAPI) {
     standDown("session_shutdown", pi, false);
   });
 
-  pi.on("before_agent_start", (event: BeforeAgentStartEvent) => {
-    // 引擎通知同步模式下，不再依赖主动解析 Prompt，等待引擎的 Started 通知
+  pi.on("before_agent_start", (_event: BeforeAgentStartEvent) => {
+    // Mode boundaries are sourced from notification lifecycle and persisted state.
   });
 
   pi.on("input", (event: InputEvent) => {
@@ -823,23 +940,24 @@ export default async function registerExtension(pi: ExtensionAPI) {
     }
 
     // ==========================================
-    // 决策链：网络(T1) -> 瞬时(T2) -> 兜底(T3)
+    // Decision chain: schema-overload -> network(T1) -> transient(T2) -> fallback(T3)
     // ==========================================
 
-    // 1. 网络/超时 (Type 1)
+    if (classifyAsSchemaOverload(combinedLog)) {
+      handleSchemaOverload(pi, reason, combinedLog);
+      return;
+    }
+
     if (NETWORK_RE.test(combinedLog)) {
       handleType1(pi, reason, combinedLog);
       return;
     }
 
-    // 2. 供应商/配额/已知语法错误 (Type 2)
     if (classifyAsType2(combinedLog)) {
       handleType2(pi, reason, combinedLog);
       return;
     }
 
-    // 3. 其他所有错误/阻塞/中断 (Type 3)
-    // 只要是非正常结束且不属于 T1/T2，即视为需要 AI 介入修复的状态异常
     handleType3(pi, reason, combinedLog, {
       triggerReason: state.isFixingType3 ? `type3_in_progress:${reason}` : reason,
     });

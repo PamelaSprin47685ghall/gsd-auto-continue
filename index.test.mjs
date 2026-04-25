@@ -57,8 +57,9 @@ test("resets retry counters on class switches and preserves type3 escalation pat
   assert.match(source, /resetRetryCount\("type1", "type2_enter"\)/);
   assert.match(source, /resetRetryCount\("type2", "type1_enter"\)/);
   assert.match(source, /resetRetryCount\("type3", "type1_enter"\)/);
+  assert.match(source, /resetSchemaOverloadRetries\("type2_enter"\)/);
+  assert.match(source, /resetSchemaOverloadRetries\("type1_enter"\)/);
 
-  assert.match(source, /if \(state\.isFixingType3 \|\| classifyAsType3\(reason, combinedLog\)\)/);
   assert.match(source, /triggerReason: state\.isFixingType3 \? `type3_in_progress:\$\{reason\}` : reason/);
 
   assert.match(source, /escalation:\s*"type1_to_type2"/);
@@ -74,6 +75,16 @@ test("guards retryLastTurn fallback with explicit safe path and no triggerTurn m
   assert.equal(source.includes("triggerTurn"), false, "sendUserMessage no longer accepts triggerTurn");
 });
 
+test("adds schema-overload continuation path with in-place retryLastTurn", () => {
+  assert.match(source, /SCHEMA_OVERLOAD_RE/);
+  assert.match(source, /function classifyAsSchemaOverload\(/);
+  assert.match(source, /function handleSchemaOverload\(/);
+  assert.match(source, /schema_overload_retry/);
+  assert.match(source, /Core schema-overload cap hit\. In-place retryLastTurn/);
+  assert.match(source, /if \(classifyAsSchemaOverload\(combinedLog\)\)/);
+  assert.equal(source.includes("/gsd auto"), true, "other paths may still use /gsd auto");
+});
+
 test("keeps stop handling simple: no custom-step soft-continue branch", () => {
   assert.equal(source.includes("CUSTOM_STEP_SOFT_CONTINUE_RE"), false);
   assert.equal(source.includes("handleSoftContinueForCustomStep"), false);
@@ -82,18 +93,16 @@ test("keeps stop handling simple: no custom-step soft-continue branch", () => {
   assert.match(source, /stop_passthrough_tool_invocation/);
 });
 
-test("captures explicit Escape pause banner as stop-time manual intervention signal", () => {
-  assert.match(source, /const ESC_PAUSE_BANNER_RE = /);
-  assert.match(source, /paused \\\(escape\\\)/);
-  assert.match(
-    source,
-    /kind === "blocked" \|\| kind === "error" \|\| kind === "input_needed" \|\| isEscPauseBanner/,
-  );
-  assert.match(source, /reason: isEscPauseBanner \? `\$\{kind\}:escape_pause_banner` : kind/);
+test("forbids command-recognition and auto-lock heuristics; keeps programmatic session-end preservation", () => {
+  assert.equal(source.includes("AUTO_MODE_COMMAND_RE"), false);
+  assert.equal(source.includes("STEP_MODE_COMMAND_RE"), false);
+  assert.equal(source.includes("STAND_DOWN_COMMAND_RE"), false);
+  assert.equal(source.includes("applyModeBoundaryFromInput"), false);
 
-  assert.equal(
-    source.includes("notification:mode_stopped_or_paused"),
-    false,
-    "notification hook must not stand down purely from generic pause/stopped text",
-  );
+  assert.equal(source.includes("AUTO_LOCK_REL_PATH"), false);
+  assert.equal(source.includes("recoverModeFromSessionLock"), false);
+  assert.equal(source.includes("existsSync("), false);
+
+  assert.match(source, /event\.reason === "programmatic" && \(state\.mode !== "inactive" \|\| state\.isFixingType3\)/);
+  assert.match(source, /logLifecycle\("session_end_mode_preserved"/);
 });
