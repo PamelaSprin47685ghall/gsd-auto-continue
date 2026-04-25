@@ -1,0 +1,16 @@
+{
+  "name": "gsd-auto-continue",
+  "version": "1.0.0",
+  "description": "GSD Auto Continue Extension - Precision 3 Tier Recovery (Verbose)",
+  "gsd": {
+    "extension": true
+  },
+  "pi": {
+    "extensions": [
+      "index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@gsd/pi-coding-agent": "*"
+  }
+}
