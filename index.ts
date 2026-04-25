@@ -2,6 +2,7 @@ import type {
   AssistantMessage,
   BeforeAgentStartEvent,
   ExtensionAPI,
+  ExtensionContext,
   InputEvent,
   NotificationEvent,
   SessionEndEvent,
@@ -43,9 +44,10 @@ const RETRY_LIMITS = {
 
 const AUTO_MODE_STARTED_RE = /\bauto-mode (started|resumed)\b/i;
 const STEP_MODE_STARTED_RE = /\bstep-mode (started|resumed)\b/i;
+const ESC_PAUSE_BANNER_RE = /\b(?:auto|step)-mode paused \(escape\)\b/i;
 
 const USER_INTERVENTION_RE =
-  /stop directive detected|queued user message interrupted|manual intervention/i;
+  /stop directive detected|queued user message interrupted|manual intervention|paused \(escape\)/i;
 
 const TYPE3_RE =
   /pre-execution checks (failed|error)|post-execution checks failed|verification gate failed|needs-remediation|blocking progression|unresolved code conflicts|pre-dispatch health check failed|reconciliation failed/i;
@@ -67,6 +69,29 @@ const state: RuntimeState = {
   isFixingType3: false,
   retryTimers: new Map(),
 };
+
+type UiNotifyLevel = "info" | "warning" | "error" | "success";
+
+let uiNotify: ((message: string, level?: UiNotifyLevel) => void) | null = null;
+
+function bindUiNotifier(ctx?: ExtensionContext): void {
+  const maybeUi = (ctx as { ui?: { notify?: unknown } } | undefined)?.ui;
+  const maybeNotify = maybeUi?.notify;
+  if (typeof maybeNotify !== "function") return;
+
+  uiNotify = (message: string, level: UiNotifyLevel = "info") => {
+    try {
+      maybeNotify.call(maybeUi, message, level);
+    } catch {
+      // Ignore UI notify failures; recovery flow must stay non-blocking.
+    }
+  };
+}
+
+function notifyLifecycleUi(payload: Record<string, unknown>): void {
+  if (!uiNotify) return;
+  uiNotify(`[AutoContinue] ${JSON.stringify(payload)}`, "info");
+}
 
 function truncate(text: string, max = 240): string {
   if (text.length <= max) return text;
@@ -110,7 +135,7 @@ function logLifecycle(
   if (typeof delayMs === "number") payload.delayMs = delayMs;
   if (escalation !== "none") payload.escalation = escalation;
 
-  console.log(`[AutoContinue] ${JSON.stringify(payload)}`);
+  notifyLifecycleUi(payload);
 }
 
 function getRetryCount(retryType: ManagedRetryType): number {
@@ -665,7 +690,8 @@ export default async function registerExtension(pi: ExtensionAPI) {
   });
 
   // Avoid side effects in factory init; announce only after a real session starts.
-  pi.on("session_start", () => {
+  pi.on("session_start", (_event, ctx) => {
+    bindUiNotifier(ctx);
     logLifecycle("hook_session_start", { reason: "session_start" });
     pi.sendMessage({
       customType: "system",
@@ -736,10 +762,12 @@ export default async function registerExtension(pi: ExtensionAPI) {
     // Notification text like "auto-mode paused" can appear on non-manual failures,
     // so we only use it as diagnostics and wait for the stop hook classification.
 
-    if (kind === "blocked" || kind === "error" || kind === "input_needed") {
+    const isEscPauseBanner = ESC_PAUSE_BANNER_RE.test(msg);
+
+    if (kind === "blocked" || kind === "error" || kind === "input_needed" || isEscPauseBanner) {
       rememberNotification(msg);
       logLifecycle("notification_stashed", {
-        reason: kind,
+        reason: isEscPauseBanner ? `${kind}:escape_pause_banner` : kind,
         detail: `count=${state.lastNotifications.length}`,
       });
     }

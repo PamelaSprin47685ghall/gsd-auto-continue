@@ -82,15 +82,18 @@ test("keeps stop handling simple: no custom-step soft-continue branch", () => {
   assert.match(source, /stop_passthrough_tool_invocation/);
 });
 
-test("does not classify generic pause text as manual intervention before stop reason classification", () => {
-  assert.equal(
-    source.includes("auto-mode paused \\(escape\\)"),
-    false,
-    "pause banner text is ambiguous and must not force stand-down",
+test("captures explicit Escape pause banner as stop-time manual intervention signal", () => {
+  assert.match(source, /const ESC_PAUSE_BANNER_RE = /);
+  assert.match(source, /paused \\\(escape\\\)/);
+  assert.match(
+    source,
+    /kind === "blocked" \|\| kind === "error" \|\| kind === "input_needed" \|\| isEscPauseBanner/,
   );
+  assert.match(source, /reason: isEscPauseBanner \? `\$\{kind\}:escape_pause_banner` : kind/);
+
   assert.equal(
     source.includes("notification:mode_stopped_or_paused"),
     false,
-    "notification hook must not stand down purely from pause/stopped text",
+    "notification hook must not stand down purely from generic pause/stopped text",
   );
 });
