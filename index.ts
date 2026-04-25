@@ -1,196 +1,843 @@
-import type { ExtensionAPI, StopEvent, AssistantMessage, NotificationEvent } from "@gsd/pi-coding-agent";
+import type {
+  AssistantMessage,
+  BeforeAgentStartEvent,
+  ExtensionAPI,
+  InputEvent,
+  NotificationEvent,
+  SessionEndEvent,
+  StopEvent,
+} from "@gsd/pi-coding-agent";
+
+type ManagedMode = "inactive" | "auto" | "step";
+type RetryType = "none" | "type1" | "type2" | "type3";
+type ManagedRetryType = Exclude<RetryType, "none">;
+type EscalationType = "none" | "type1_to_type2" | "type2_to_type3";
+
+interface ScheduledRetryTimer {
+  handle: ReturnType<typeof setTimeout>;
+  phase: string;
+  attempt: number;
+  reason: string;
+  delayMs: number;
+  escalation: EscalationType;
+  detail?: string;
+}
+
+interface RuntimeState {
+  mode: ManagedMode;
+  lastNotifications: string[];
+  type1Retries: number;
+  type2Retries: number;
+  type3Retries: number;
+  isFixingType3: boolean;
+  retryTimers: Map<ManagedRetryType, ScheduledRetryTimer>;
+}
+
+const PLUGIN = "gsd-auto-continue";
+const MAX_NOTIFICATIONS = 5;
+const RETRY_LIMITS = {
+  type1: 10,
+  type2: 5,
+  type3: 3,
+} as const;
+
+const AUTO_MODE_STARTED_RE = /\bauto-mode (started|resumed)\b/i;
+const STEP_MODE_STARTED_RE = /\bstep-mode (started|resumed)\b/i;
+const MODE_STOPPED_RE = /\b(auto|step)-mode (stopped|paused)\b/i;
+
+const USER_INTERVENTION_RE =
+  /auto-mode paused \(escape\)|stop directive detected|queued user message interrupted/i;
+
+const TYPE3_RE =
+  /pre-execution checks (failed|error)|post-execution checks failed|verification gate failed|needs-remediation|blocking progression|unresolved code conflicts|pre-dispatch health check failed|reconciliation failed/i;
+
+const TYPE2_RE =
+  /tool invocation failed|structured argument generation failed|context overflow|auto-compaction failed|empty-turn recovery|rate.?limit|429|quota|unauthorized|overloaded|500|502|503/i;
+
+const NETWORK_RE = /network|timeout|econnreset|socket|fetch failed|stream idle/i;
+
+const state: RuntimeState = {
+  mode: "inactive",
+  lastNotifications: [],
+  type1Retries: 0,
+  type2Retries: 0,
+  type3Retries: 0,
+  isFixingType3: false,
+  retryTimers: new Map(),
+};
+
+function truncate(text: string, max = 240): string {
+  if (text.length <= max) return text;
+  return `${text.slice(0, max - 3)}...`;
+}
+
+function normalizeError(error: unknown): string {
+  if (error instanceof Error) return `${error.name}: ${error.message}`;
+  return String(error);
+}
+
+function logLifecycle(
+  phase: string,
+  {
+    retryType = "none",
+    attempt = 0,
+    reason = "n/a",
+    detail,
+    delayMs,
+    escalation = "none",
+  }: {
+    retryType?: RetryType;
+    attempt?: number;
+    reason?: string;
+    detail?: string;
+    delayMs?: number;
+    escalation?: EscalationType;
+  } = {},
+): void {
+  const payload: Record<string, unknown> = {
+    plugin: PLUGIN,
+    phase,
+    retryType,
+    attempt,
+    reason,
+    mode: state.mode,
+    fixingType3: state.isFixingType3,
+  };
+
+  if (detail) payload.detail = truncate(detail, 320);
+  if (typeof delayMs === "number") payload.delayMs = delayMs;
+  if (escalation !== "none") payload.escalation = escalation;
+
+  console.log(`[AutoContinue] ${JSON.stringify(payload)}`);
+}
+
+function getRetryCount(retryType: ManagedRetryType): number {
+  switch (retryType) {
+    case "type1":
+      return state.type1Retries;
+    case "type2":
+      return state.type2Retries;
+    case "type3":
+      return state.type3Retries;
+  }
+}
+
+function setRetryCount(retryType: ManagedRetryType, value: number): void {
+  switch (retryType) {
+    case "type1":
+      state.type1Retries = value;
+      break;
+    case "type2":
+      state.type2Retries = value;
+      break;
+    case "type3":
+      state.type3Retries = value;
+      break;
+  }
+}
+
+function resetRetryCount(retryType: ManagedRetryType, reason: string, forceLog = false): void {
+  const current = getRetryCount(retryType);
+  if (current === 0 && !forceLog) return;
+
+  setRetryCount(retryType, 0);
+  logLifecycle("retry_reset", {
+    retryType,
+    attempt: 0,
+    reason,
+  });
+}
+
+function resetRetries(reason: string, forceLog = false): void {
+  resetRetryCount("type1", reason, forceLog);
+  resetRetryCount("type2", reason, forceLog);
+  resetRetryCount("type3", reason, forceLog);
+}
+
+function rememberNotification(message: string): void {
+  state.lastNotifications.push(message);
+  if (state.lastNotifications.length > MAX_NOTIFICATIONS) {
+    state.lastNotifications.shift();
+  }
+}
+
+function consumeStopDiagnostics(errorMessage: string): string {
+  const combined = `${state.lastNotifications.join(" | ")} ${errorMessage}`.trim().toLowerCase();
+  state.lastNotifications = [];
+  return combined;
+}
+
+function cancelRetryTimer(retryType: ManagedRetryType, reason: string): void {
+  const timer = state.retryTimers.get(retryType);
+  if (!timer) return;
+
+  clearTimeout(timer.handle);
+  state.retryTimers.delete(retryType);
+
+  logLifecycle("timer_cancel", {
+    retryType,
+    attempt: timer.attempt,
+    reason,
+    detail: timer.phase,
+    delayMs: timer.delayMs,
+    escalation: timer.escalation,
+  });
+}
+
+function cancelRetryTimersExcept(activeType: ManagedRetryType, reason: string): void {
+  for (const retryType of Array.from(state.retryTimers.keys())) {
+    if (retryType === activeType) continue;
+    cancelRetryTimer(retryType, `${reason}:superseded`);
+  }
+}
+
+function cancelAllRetryTimers(reason: string): void {
+  for (const retryType of Array.from(state.retryTimers.keys())) {
+    cancelRetryTimer(retryType, reason);
+  }
+}
+
+function scheduleRetryTimer(
+  retryType: ManagedRetryType,
+  delayMs: number,
+  {
+    phase,
+    attempt,
+    reason,
+    detail,
+    escalation = "none",
+  }: {
+    phase: string;
+    attempt: number;
+    reason: string;
+    detail?: string;
+    escalation?: EscalationType;
+  },
+  action: () => void,
+): void {
+  cancelRetryTimer(retryType, `${phase}:replace_existing`);
+
+  logLifecycle(`${phase}_scheduled`, {
+    retryType,
+    attempt,
+    reason,
+    detail,
+    delayMs,
+    escalation,
+  });
+
+  const timerHandle = setTimeout(() => {
+    const current = state.retryTimers.get(retryType);
+    if (!current || current.handle !== timerHandle) {
+      logLifecycle(`${phase}_skip_stale`, {
+        retryType,
+        attempt,
+        reason: `${reason}:stale_timer`,
+        delayMs,
+        escalation,
+      });
+      return;
+    }
+
+    state.retryTimers.delete(retryType);
+    logLifecycle(`${phase}_fired`, {
+      retryType,
+      attempt,
+      reason,
+      detail,
+      delayMs,
+      escalation,
+    });
+
+    try {
+      action();
+    } catch (error) {
+      logLifecycle(`${phase}_action_failed`, {
+        retryType,
+        attempt,
+        reason,
+        delayMs,
+        escalation,
+        detail: normalizeError(error),
+      });
+    }
+  }, delayMs);
+
+  state.retryTimers.set(retryType, {
+    handle: timerHandle,
+    phase,
+    attempt,
+    reason,
+    delayMs,
+    escalation,
+    detail,
+  });
+}
+
+function transitionMode(next: ManagedMode, reason: string): void {
+  if (state.mode === next) {
+    logLifecycle("mode_noop", { reason, detail: `mode=${next}` });
+    return;
+  }
+
+  const previous = state.mode;
+  state.mode = next;
+
+  logLifecycle("mode_transition", {
+    reason,
+    detail: `${previous} -> ${next}`,
+  });
+
+  if (next === "inactive") {
+    state.isFixingType3 = false;
+    cancelAllRetryTimers(`${reason}:inactive`);
+    state.lastNotifications = [];
+    resetRetries(`${reason}:inactive`, true);
+    return;
+  }
+
+  cancelAllRetryTimers(`${reason}:active_boundary`);
+  state.lastNotifications = [];
+  resetRetries(`${reason}:active`, true);
+}
+
+function standDown(reason: string, pi: ExtensionAPI, notify = false): void {
+  const wasActive = state.mode !== "inactive" || state.isFixingType3;
+  transitionMode("inactive", reason);
+
+  if (notify && wasActive) {
+    pi.sendMessage({
+      customType: "system",
+      content: "ℹ️ [AutoContinue] User/manual intervention detected. Auto-recovery stood down.",
+      display: true,
+    });
+  }
+}
+
+function parseModeFromCommand(text: string): ManagedMode | undefined {
+  const trimmed = text.trim();
+  if (!trimmed.startsWith("/gsd")) return undefined;
+
+  if (/^\/gsd\s+next\b/i.test(trimmed) || /^\/gsd\s+step\b/i.test(trimmed)) {
+    return "step";
+  }
+
+  if (/^\/gsd\s+auto\b/i.test(trimmed)) {
+    // Defensive parsing: support accidental "--step" usage as step intent.
+    if (/\s--step\b/i.test(trimmed)) return "step";
+    return "auto";
+  }
+
+  return undefined;
+}
+
+function resumeCommandForMode(mode: ManagedMode): string {
+  return mode === "step" ? "/gsd next" : "/gsd auto";
+}
+
+function safeSendUserMessage(
+  piApi: ExtensionAPI,
+  content: string,
+  {
+    phase,
+    retryType,
+    attempt,
+    reason,
+    escalation = "none",
+  }: {
+    phase: string;
+    retryType: ManagedRetryType;
+    attempt: number;
+    reason: string;
+    escalation?: EscalationType;
+  },
+): boolean {
+  try {
+    piApi.sendUserMessage(content);
+    return true;
+  } catch (error) {
+    logLifecycle(`${phase}_send_user_message_failed`, {
+      retryType,
+      attempt,
+      reason,
+      escalation,
+      detail: normalizeError(error),
+    });
+    return false;
+  }
+}
+
+function safeRetryLastTurn(
+  piApi: ExtensionAPI,
+  {
+    phase,
+    retryType,
+    attempt,
+    reason,
+  }: {
+    phase: string;
+    retryType: ManagedRetryType;
+    attempt: number;
+    reason: string;
+  },
+): boolean {
+  const maybeRetry = (piApi as { retryLastTurn?: unknown }).retryLastTurn;
+  if (typeof maybeRetry !== "function") {
+    logLifecycle(`${phase}_retry_last_turn_unavailable`, {
+      retryType,
+      attempt,
+      reason: `${reason}:retryLastTurn_missing`,
+    });
+    return false;
+  }
+
+  try {
+    maybeRetry.call(piApi);
+    logLifecycle(`${phase}_retry_last_turn_called`, {
+      retryType,
+      attempt,
+      reason,
+    });
+    return true;
+  } catch (error) {
+    logLifecycle(`${phase}_retry_last_turn_failed`, {
+      retryType,
+      attempt,
+      reason,
+      detail: normalizeError(error),
+    });
+    return false;
+  }
+}
+
+function getStopErrorMessage(event: StopEvent): string {
+  const lastMsg = event.lastMessage as AssistantMessage | undefined;
+  const maybeError = (lastMsg as { errorMessage?: unknown } | undefined)?.errorMessage;
+  return typeof maybeError === "string" ? maybeError : "";
+}
+
+function classifyAsType3(reason: StopEvent["reason"], combinedLog: string): boolean {
+  return reason === "blocked" || TYPE3_RE.test(combinedLog);
+}
+
+function classifyAsType2(combinedLog: string): boolean {
+  return TYPE2_RE.test(combinedLog);
+}
+
+function handleType3(
+  piApi: ExtensionAPI,
+  stopReason: StopEvent["reason"],
+  combinedLog: string,
+  {
+    triggerReason,
+    escalation = "none",
+  }: {
+    triggerReason: string;
+    escalation?: EscalationType;
+  },
+): void {
+  cancelRetryTimersExcept("type3", `type3_enter:${triggerReason}`);
+  resetRetryCount("type1", `type3_enter:${triggerReason}`);
+  resetRetryCount("type2", `type3_enter:${triggerReason}`);
+
+  if (state.retryTimers.has("type3")) {
+    logLifecycle("type3_retry_pending", {
+      retryType: "type3",
+      attempt: state.type3Retries,
+      reason: triggerReason,
+      escalation,
+      detail: "timer_already_scheduled",
+    });
+    return;
+  }
+
+  if (state.type3Retries >= RETRY_LIMITS.type3) {
+    piApi.sendMessage({
+      customType: "system",
+      content: `❌ [AutoContinue] Type 3 fix exhausted (${RETRY_LIMITS.type3}/${RETRY_LIMITS.type3}). Manual intervention required.`,
+      display: true,
+    });
+    standDown("type3_exhausted", piApi, false);
+    return;
+  }
+
+  state.type3Retries += 1;
+  state.isFixingType3 = true;
+
+  const attempt = state.type3Retries;
+  const diagnosis = combinedLog || stopReason;
+
+  piApi.sendMessage({
+    customType: "system",
+    content: `🚨 [AutoContinue] Blocker/State issue detected. Dispatching Type 3 LLM fix (Attempt ${attempt}/${RETRY_LIMITS.type3})...`,
+    display: true,
+  });
+
+  const prompt = `Auto-mode was paused due to a blocking issue or failed verification:\n\n${diagnosis}\n\nPlease diagnose and fix this specific issue. Use the necessary tools (e.g., edit files, resolve git conflicts, fix tests or adjust the plan). I will resume auto/step mode automatically once you finish this turn. Do not ask for confirmation.`;
+
+  scheduleRetryTimer(
+    "type3",
+    2000,
+    {
+      phase: "type3_fix",
+      attempt,
+      reason: triggerReason,
+      detail: "dispatch_llm_fix_prompt",
+      escalation,
+    },
+    () => {
+      safeSendUserMessage(piApi, prompt, {
+        phase: "type3_fix",
+        retryType: "type3",
+        attempt,
+        reason: triggerReason,
+        escalation,
+      });
+    },
+  );
+}
+
+function handleType2(piApi: ExtensionAPI, stopReason: StopEvent["reason"], combinedLog: string): void {
+  cancelRetryTimersExcept("type2", "type2_enter");
+  resetRetryCount("type1", "type2_enter");
+  resetRetryCount("type3", "type2_enter");
+
+  if (state.retryTimers.has("type2")) {
+    logLifecycle("type2_retry_pending", {
+      retryType: "type2",
+      attempt: state.type2Retries,
+      reason: stopReason,
+      detail: "timer_already_scheduled",
+    });
+    return;
+  }
+
+  const resumeCommand = resumeCommandForMode(state.mode);
+
+  if (state.type2Retries < RETRY_LIMITS.type2) {
+    state.type2Retries += 1;
+
+    const attempt = state.type2Retries;
+    piApi.sendMessage({
+      customType: "system",
+      content: `⚠️ [AutoContinue] Provider/Syntax error. Type 2 restart in 5s (Attempt ${attempt}/${RETRY_LIMITS.type2})...`,
+      display: true,
+    });
+
+    scheduleRetryTimer(
+      "type2",
+      5000,
+      {
+        phase: "type2_retry",
+        attempt,
+        reason: stopReason,
+        detail: resumeCommand,
+      },
+      () => {
+        safeSendUserMessage(piApi, resumeCommand, {
+          phase: "type2_retry",
+          retryType: "type2",
+          attempt,
+          reason: stopReason,
+        });
+      },
+    );
+    return;
+  }
+
+  resetRetryCount("type2", "type2_exhausted", true);
+
+  piApi.sendMessage({
+    customType: "system",
+    content: "⚠️ [AutoContinue] Type 2 exhausted. Escalating to Type 3...",
+    display: true,
+  });
+
+  handleType3(piApi, stopReason, combinedLog, {
+    triggerReason: "type2_exhausted",
+    escalation: "type2_to_type3",
+  });
+}
+
+function handleType1(piApi: ExtensionAPI, stopReason: StopEvent["reason"], combinedLog: string): void {
+  cancelRetryTimersExcept("type1", "type1_enter");
+  resetRetryCount("type2", "type1_enter");
+  resetRetryCount("type3", "type1_enter");
+
+  if (state.retryTimers.has("type1")) {
+    logLifecycle("type1_retry_pending", {
+      retryType: "type1",
+      attempt: state.type1Retries,
+      reason: stopReason,
+      detail: "timer_already_scheduled",
+    });
+    return;
+  }
+
+  const networkLike = NETWORK_RE.test(combinedLog);
+  const reason = networkLike ? "network_or_timeout" : stopReason;
+
+  if (state.type1Retries < RETRY_LIMITS.type1) {
+    state.type1Retries += 1;
+    const attempt = state.type1Retries;
+
+    // 指数退避: 2s, 4s, 8s... 封顶 30s
+    const delayMs = Math.min(2000 * 2 ** (attempt - 1), 30000);
+
+    piApi.sendMessage({
+      customType: "system",
+      content: `📶 [AutoContinue] Transient error. Type 1 retry in ${delayMs / 1000}s (Attempt ${attempt}/${RETRY_LIMITS.type1})...`,
+      display: true,
+    });
+
+    scheduleRetryTimer(
+      "type1",
+      delayMs,
+      {
+        phase: "type1_retry",
+        attempt,
+        reason,
+        detail: networkLike ? "retryLastTurn" : "fallback_resume_command",
+      },
+      () => {
+        if (
+          safeRetryLastTurn(piApi, {
+            phase: "type1_retry",
+            retryType: "type1",
+            attempt,
+            reason,
+          })
+        ) {
+          return;
+        }
+
+        const resumeCommand = resumeCommandForMode(state.mode);
+        safeSendUserMessage(piApi, resumeCommand, {
+          phase: "type1_retry_fallback",
+          retryType: "type1",
+          attempt,
+          reason: `${reason}:retry_last_turn_fallback`,
+        });
+      },
+    );
+    return;
+  }
+
+  resetRetryCount("type1", "type1_exhausted", true);
+
+  const resumeCommand = resumeCommandForMode(state.mode);
+  const attempt = Math.min(state.type2Retries + 1, RETRY_LIMITS.type2);
+  state.type2Retries = attempt;
+
+  piApi.sendMessage({
+    customType: "system",
+    content: "⚠️ [AutoContinue] Type 1 exhausted. Escalating to Type 2...",
+    display: true,
+  });
+
+  scheduleRetryTimer(
+    "type2",
+    2000,
+    {
+      phase: "type1_escalate_to_type2",
+      attempt,
+      reason: "type1_exhausted",
+      detail: resumeCommand,
+      escalation: "type1_to_type2",
+    },
+    () => {
+      safeSendUserMessage(piApi, resumeCommand, {
+        phase: "type1_escalate_to_type2",
+        retryType: "type2",
+        attempt,
+        reason: "type1_exhausted",
+        escalation: "type1_to_type2",
+      });
+    },
+  );
+}
 
 export default async function registerExtension(pi: ExtensionAPI) {
-  console.log("[AutoContinue] Extension registering...");
-  
-  let isAutoMode = false;
-  let lastNotifications: string[] = [];
-  let type1Retries = 0;
-  let type2Retries = 0;
-  let type3Retries = 0;
-  let isFixingType3 = false;
-
-  pi.sendMessage({
-    customType: "system",
-    content: "🚀 [AutoContinue] Verbose mode enabled. Listening for GSD lifecycle events...",
-    display: true
+  logLifecycle("factory_registered", {
+    reason: "extension_factory_initialized",
   });
 
-  // 1. 持续收集 GSD 内部发出的 Notification，以精准捕获 pauseAuto 的原因
-  pi.events.on("notification", (data: any) => {
-    const event = data as NotificationEvent;
-    const msg = String(event.message || "");
-    const kind = event.kind || "info";
-
-    console.log(`[AutoContinue] Notification [${kind}]: ${msg}`);
-
-    if (msg.includes("Auto-mode started") || msg.includes("Step-mode started")) {
-      console.log("[AutoContinue] Auto-mode detected via notification.");
-      isAutoMode = true;
-      lastNotifications = []; // 新阶段，清空旧日志
-    }
-
-    if (kind === "warning" || kind === "error" || kind === "blocked") {
-      console.log(`[AutoContinue] Stashing important notification: ${msg}`);
-      lastNotifications.push(msg);
-      if (lastNotifications.length > 5) lastNotifications.shift();
-    }
+  // Avoid side effects in factory init; announce only after a real session starts.
+  pi.on("session_start", () => {
+    logLifecycle("hook_session_start", { reason: "session_start" });
+    pi.sendMessage({
+      customType: "system",
+      content: "🚀 [AutoContinue] Verbose lifecycle mode enabled. Waiting for auto/step-mode boundaries...",
+      display: true,
+    });
   });
 
-  // 2. 拦截核心 Stop 事件
-  pi.events.on("stop", async (data: any) => {
-    const event = data as StopEvent;
-    const reason = event.reason;
-    
-    console.log(`[AutoContinue] Stop event received. Reason: ${reason}, isAutoMode: ${isAutoMode}, isFixingType3: ${isFixingType3}`);
+  pi.on("session_end", (event: SessionEndEvent) => {
+    logLifecycle("hook_session_end", {
+      reason: `session_end:${event.reason}`,
+      detail: event.sessionFile,
+    });
+    standDown(`session_end:${event.reason}`, pi, false);
+  });
 
-    // --- Type 3 修复回合结束，恢复 Auto-mode ---
-    if (isFixingType3 && reason === "completed") {
-      console.log("[AutoContinue] Type 3 fix loop detected 'completed'. Resuming auto-mode.");
-      isFixingType3 = false;
-      type3Retries = 0;
-      lastNotifications = [];
-      pi.sendMessage({ 
-        customType: "system", 
-        content: "✅ [AutoContinue] Type 3 fix completed. Resuming Auto-mode...", 
-        display: true 
+  pi.on("session_shutdown", () => {
+    logLifecycle("hook_session_shutdown", { reason: "session_shutdown" });
+    standDown("session_shutdown", pi, false);
+  });
+
+  pi.on("before_agent_start", (event: BeforeAgentStartEvent) => {
+    const modeFromPrompt = parseModeFromCommand(event.prompt || "");
+    if (!modeFromPrompt) return;
+
+    transitionMode(modeFromPrompt, `before_agent_start:${modeFromPrompt}`);
+  });
+
+  pi.on("input", (event: InputEvent) => {
+    if (event.source !== "interactive") return;
+
+    const text = String(event.text || "").trim();
+    if (!text) return;
+
+    const modeCommand = parseModeFromCommand(text);
+    if (modeCommand) return;
+
+    if (state.mode !== "inactive" && !state.isFixingType3) {
+      logLifecycle("hook_input_manual_intervention", {
+        reason: "interactive_input_while_mode_active",
+        detail: text,
       });
-      setTimeout(() => {
-        console.log("[AutoContinue] Sending /gsd auto...");
-        pi.sendUserMessage("/gsd auto");
-      }, 1500);
+      standDown("interactive_input", pi, true);
+    }
+  });
+
+  // 持续收集 GSD 内部发出的 Notification，以精准捕获 pauseAuto 的原因
+  pi.on("notification", (event: NotificationEvent) => {
+    const msg = String(event.message || "");
+    const kind = event.kind || "error";
+
+    logLifecycle("hook_notification", {
+      reason: kind,
+      detail: msg,
+    });
+
+    if (AUTO_MODE_STARTED_RE.test(msg)) {
+      transitionMode("auto", "notification:auto_started_or_resumed");
       return;
     }
 
-    // --- GSD 正常完成所有里程碑，重置状态 ---
-    if (reason === "completed") {
-      console.log("[AutoContinue] GSD completed naturally. Resetting counters.");
-      type1Retries = 0; type2Retries = 0; type3Retries = 0; isAutoMode = false;
+    if (STEP_MODE_STARTED_RE.test(msg)) {
+      transitionMode("step", "notification:step_started_or_resumed");
       return;
     }
 
-    // 仅在 Auto mode 下被中断才触发兜底
-    if (!isAutoMode) {
-      console.log("[AutoContinue] Stop event ignored because isAutoMode is false.");
-      // 特殊情况：如果是 Type 1 网络错误，非 auto mode 也可以原地重试一次
-      const lastMsg = event.lastMessage as AssistantMessage | undefined;
-      const errorMsg = lastMsg?.errorMessage || "";
-      const isNetwork = /network|timeout|econnreset|socket|fetch failed|stream idle/i.test(errorMsg);
-      
-      if (isNetwork && type1Retries < 10) {
-          console.log("[AutoContinue] Non-auto mode network error. Triggering Type 1 retry.");
-          handleType1(event, errorMsg);
-      }
+    if (MODE_STOPPED_RE.test(msg)) {
+      standDown("notification:mode_stopped_or_paused", pi, false);
       return;
     }
 
-    const lastMsg = event.lastMessage as AssistantMessage | undefined;
-    const errorMsg = lastMsg?.errorMessage || "";
-    const combinedLog = (lastNotifications.join(" | ") + " " + errorMsg).toLowerCase();
+    if (kind === "blocked" || kind === "error" || kind === "input_needed") {
+      rememberNotification(msg);
+      logLifecycle("notification_stashed", {
+        reason: kind,
+        detail: `count=${state.lastNotifications.length}`,
+      });
+    }
+  });
 
-    console.log(`[AutoContinue] Analyzing combined logs: ${combinedLog}`);
+  // 拦截核心 Stop 事件
+  pi.on("stop", (event: StopEvent) => {
+    const reason = event.reason;
+    const errorMsg = getStopErrorMessage(event);
+    const combinedLog = consumeStopDiagnostics(errorMsg);
 
-    // ==========================================
-    // 0. Exclude: 用户主动介入 (绝不恢复)
-    // ==========================================
-    if (
-      combinedLog.includes("auto-mode paused (escape)") ||
-      combinedLog.includes("stop directive detected") ||
-      combinedLog.includes("queued user message interrupted")
-    ) {
-      console.log("[AutoContinue] User intervention detected. Standing down.");
+    logLifecycle("hook_stop", {
+      reason,
+      detail: combinedLog || "(empty)",
+    });
+
+    // Type 3 修复回合结束，按进入时模式恢复。
+    if (state.isFixingType3 && reason === "completed") {
+      state.isFixingType3 = false;
+      resetRetries("type3_fix_completed", true);
+
+      const resumeCommand = resumeCommandForMode(state.mode);
       pi.sendMessage({
         customType: "system",
-        content: "ℹ️ [AutoContinue] User intervention detected. Auto-recovery disabled.",
-        display: true
+        content: `✅ [AutoContinue] Type 3 fix completed. Resuming ${state.mode === "step" ? "Step" : "Auto"}-mode...`,
+        display: true,
       });
-      isAutoMode = false;
-      return; 
+
+      scheduleRetryTimer(
+        "type3",
+        1500,
+        {
+          phase: "type3_resume",
+          attempt: 0,
+          reason: "type3_fix_completed",
+          detail: resumeCommand,
+        },
+        () => {
+          safeSendUserMessage(pi, resumeCommand, {
+            phase: "type3_resume",
+            retryType: "type3",
+            attempt: 0,
+            reason: "type3_fix_completed",
+          });
+        },
+      );
+      return;
+    }
+
+    if (reason === "completed") {
+      // GSD 正常完成当前自动化阶段，退出托管模式。
+      standDown("stop:completed", pi, false);
+      return;
+    }
+
+    if (reason === "cancelled") {
+      // 取消通常意味着人工介入或显式中止，直接撤防。
+      standDown("stop:cancelled", pi, true);
+      return;
+    }
+
+    if (state.mode === "inactive") {
+      logLifecycle("stop_ignored", {
+        reason,
+        detail: "mode_inactive",
+      });
+      return;
+    }
+
+    // Exclude: 用户主动介入 (绝不恢复)
+    if (USER_INTERVENTION_RE.test(combinedLog)) {
+      logLifecycle("stop_stand_down_user_intervention", {
+        reason,
+      });
+      standDown("stop:user_intervention_detected", pi, true);
+      return;
     }
 
     // ==========================================
-    // Type 3: State Corruption / Code Blocker 
+    // Type 3: State Corruption / Code Blocker
     // ==========================================
-    const isType3 = 
-      reason === "blocked" ||
-      /pre-execution checks (failed|error)|post-execution checks failed|verification gate failed|needs-remediation|blocking progression|unresolved code conflicts|pre-dispatch health check failed|reconciliation failed/i.test(combinedLog);
-
-    if (isType3) {
-      console.log("[AutoContinue] Classified as Type 3 (State/Blocker).");
-      if (type3Retries < 3) {
-        type3Retries++;
-        isFixingType3 = true;
-        pi.sendMessage({ 
-          customType: "system", 
-          content: `🚨 [AutoContinue] Blocker/State Corruption detected. Dispatching Type 3 LLM fix (Attempt ${type3Retries}/3)...`, 
-          display: true 
-        });
-        
-        const prompt = `Auto-mode was paused due to a blocking issue or failed verification:\n\n${combinedLog}\n\nPlease diagnose and fix this specific issue. Use the necessary tools (e.g., edit files, resolve git conflicts, fix tests or adjust the plan). I will resume auto-mode automatically once you finish this turn. Do not ask for confirmation.`;
-        
-        console.log(`[AutoContinue] Sending Type 3 prompt: ${prompt}`);
-        setTimeout(() => pi.sendUserMessage(prompt, { triggerTurn: true }), 2000);
-      } else {
-        console.log("[AutoContinue] Type 3 retries exhausted.");
-        pi.sendMessage({ customType: "system", content: `❌ [AutoContinue] Type 3 fix exhausted (3/3). Manual intervention required.`, display: true });
-        isAutoMode = false; isFixingType3 = false;
-      }
+    if (state.isFixingType3 || classifyAsType3(reason, combinedLog)) {
+      handleType3(pi, reason, combinedLog, {
+        triggerReason: state.isFixingType3 ? `type3_in_progress:${reason}` : reason,
+      });
       return;
     }
 
     // ==========================================
     // Type 2: Provider / Context / LLM Syntax
     // ==========================================
-    const isType2 =
-      /tool invocation failed|structured argument generation failed|context overflow|auto-compaction failed|empty-turn recovery|rate.?limit|429|quota|unauthorized|overloaded|500|502|503/i.test(combinedLog);
-
-    if (isType2) {
-      console.log("[AutoContinue] Classified as Type 2 (Provider/Syntax).");
-      if (type2Retries < 5) {
-        type2Retries++;
-        pi.sendMessage({ customType: "system", content: `⚠️ [AutoContinue] Provider/Syntax error. Type 2 auto-restart in 5s (Attempt ${type2Retries}/5)...`, display: true });
-        // 发送 /gsd auto 可以刷新一次底层上下文，跳过导致死循环的坏节点
-        console.log("[AutoContinue] Scheduling /gsd auto in 5s...");
-        setTimeout(() => pi.sendUserMessage("/gsd auto"), 5000);
-      } else {
-        console.log("[AutoContinue] Type 2 exhausted. Escalating to Type 3.");
-        type2Retries = 0;
-        pi.sendMessage({ customType: "system", content: `⚠️ [AutoContinue] Type 2 exhausted. Escalating to Type 3...`, display: true });
-        setTimeout(() => pi.sendUserMessage("Auto-mode encountered persistent provider or syntax errors. Please review the recent state and take actions to bypass the issue, then finish your turn.", { triggerTurn: true }), 2000);
-        isFixingType3 = true;
-      }
+    if (classifyAsType2(combinedLog)) {
+      handleType2(pi, reason, combinedLog);
       return;
     }
 
     // ==========================================
     // Type 1: Network Transient / Timeout
     // ==========================================
-    console.log("[AutoContinue] Defaulting to Type 1 (Network/Timeout).");
-    handleType1(event, combinedLog);
+    handleType1(pi, reason, combinedLog);
   });
-
-  function handleType1(event: StopEvent, combinedLog: string) {
-    if (type1Retries < 10) {
-      type1Retries++;
-      // 指数退避: 2s, 4s, 8s... 封顶 30s
-      const delayMs = Math.min(2000 * Math.pow(2, type1Retries - 1), 30000);
-      console.log(`[AutoContinue] Type 1 retry scheduled in ${delayMs}ms. Attempt ${type1Retries}/10.`);
-      pi.sendMessage({ customType: "system", content: `📶 [AutoContinue] Transient error. Type 1 in-place retry in ${delayMs/1000}s (Attempt ${type1Retries}/10)...`, display: true });
-      
-      setTimeout(() => {
-        if (typeof (pi as any).retryLastTurn === 'function') {
-          console.log("[AutoContinue] Executing pi.retryLastTurn().");
-          (pi as any).retryLastTurn();
-        } else {
-          console.log("[AutoContinue] pi.retryLastTurn not available. Sending user message to retry.");
-          pi.sendUserMessage("A transient network or timeout error occurred. Please retry your last action.", { triggerTurn: true });
-        }
-      }, delayMs);
-    } else {
-      console.log("[AutoContinue] Type 1 exhausted. Escalating to Type 2.");
-      type1Retries = 0;
-      pi.sendMessage({ customType: "system", content: `⚠️ [AutoContinue] Type 1 exhausted. Escalating to Type 2...`, display: true });
-      setTimeout(() => pi.sendUserMessage("/gsd auto"), 2000);
-    }
-  }
 }
