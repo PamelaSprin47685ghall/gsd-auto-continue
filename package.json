@@ -1,14 +1,14 @@
 {
   "name": "gsd-auto-continue",
   "version": "1.0.0",
-  "description": "GSD Auto Continue Extension - two-tier recovery for hot-context retries and root-cause fix loops",
+  "type": "module",
+  "description": "Small Pi/GSD extension that retries recoverable auto-mode stops.",
   "gsd": {
     "extension": true
   },
   "scripts": {
-    "test": "node --test index.test.mjs",
-    "verify:boundaries": "node scripts/verify-boundaries.mjs",
-    "verify": "npm run test && npm run verify:boundaries"
+    "test": "node --test tests/*.test.mjs",
+    "verify": "npm run test"
   },
   "pi": {
     "extensions": [
