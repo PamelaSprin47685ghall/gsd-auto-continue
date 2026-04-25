@@ -73,3 +73,24 @@ test("guards retryLastTurn fallback with explicit safe path and no triggerTurn m
 
   assert.equal(source.includes("triggerTurn"), false, "sendUserMessage no longer accepts triggerTurn");
 });
+
+test("keeps stop handling simple: no custom-step soft-continue branch", () => {
+  assert.equal(source.includes("CUSTOM_STEP_SOFT_CONTINUE_RE"), false);
+  assert.equal(source.includes("handleSoftContinueForCustomStep"), false);
+  assert.equal(source.includes("stop_cancelled_reclassified"), false);
+  assert.match(source, /TOOL_INVOCATION_PASSTHROUGH_RE/);
+  assert.match(source, /stop_passthrough_tool_invocation/);
+});
+
+test("does not classify generic pause text as manual intervention before stop reason classification", () => {
+  assert.equal(
+    source.includes("auto-mode paused \\(escape\\)"),
+    false,
+    "pause banner text is ambiguous and must not force stand-down",
+  );
+  assert.equal(
+    source.includes("notification:mode_stopped_or_paused"),
+    false,
+    "notification hook must not stand down purely from pause/stopped text",
+  );
+});

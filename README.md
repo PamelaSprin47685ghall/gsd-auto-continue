@@ -33,7 +33,7 @@ gsd install .
 This implementation is intentionally "noisy" to facilitate debugging and observability:
 - **Internal Logs**: Check your terminal for `[AutoContinue]` prefixed messages tracking every notification and state transition.
 - **System Messages**: Real-time recovery status is displayed directly in the chat interface as system notifications.
-- **Intervention Detection**: Automatically stands down if it detects manual user intervention (e.g., Escape key or stop directives).
+- **Intervention Detection**: Automatically stands down only on explicit manual-intervention signals (e.g., stop directives, queued user interruption, or cancelled stops).
 
 ## S02 Lifecycle Failure-Path Regression Matrix (S03 Reuse)
 

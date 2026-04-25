@@ -43,16 +43,18 @@ const RETRY_LIMITS = {
 
 const AUTO_MODE_STARTED_RE = /\bauto-mode (started|resumed)\b/i;
 const STEP_MODE_STARTED_RE = /\bstep-mode (started|resumed)\b/i;
-const MODE_STOPPED_RE = /\b(auto|step)-mode (stopped|paused)\b/i;
 
 const USER_INTERVENTION_RE =
-  /auto-mode paused \(escape\)|stop directive detected|queued user message interrupted/i;
+  /stop directive detected|queued user message interrupted|manual intervention/i;
 
 const TYPE3_RE =
   /pre-execution checks (failed|error)|post-execution checks failed|verification gate failed|needs-remediation|blocking progression|unresolved code conflicts|pre-dispatch health check failed|reconciliation failed/i;
 
 const TYPE2_RE =
-  /tool invocation failed|structured argument generation failed|context overflow|auto-compaction failed|empty-turn recovery|rate.?limit|429|quota|unauthorized|overloaded|500|502|503/i;
+  /context overflow|auto-compaction failed|empty-turn recovery|rate.?limit|429|quota|unauthorized|overloaded|500|502|503/i;
+
+const TOOL_INVOCATION_PASSTHROUGH_RE =
+  /tool invocation failed|structured argument generation failed|validation failed for tool/i;
 
 const NETWORK_RE = /network|timeout|econnreset|socket|fetch failed|stream idle/i;
 
@@ -730,10 +732,9 @@ export default async function registerExtension(pi: ExtensionAPI) {
       return;
     }
 
-    if (MODE_STOPPED_RE.test(msg)) {
-      standDown("notification:mode_stopped_or_paused", pi, false);
-      return;
-    }
+    // Stop/cancel/retry decisions must be based on the structured stop reason.
+    // Notification text like "auto-mode paused" can appear on non-manual failures,
+    // so we only use it as diagnostics and wait for the stop hook classification.
 
     if (kind === "blocked" || kind === "error" || kind === "input_needed") {
       rememberNotification(msg);
@@ -791,6 +792,15 @@ export default async function registerExtension(pi: ExtensionAPI) {
     if (reason === "completed") {
       // GSD 正常完成当前自动化阶段，退出托管模式。
       standDown("stop:completed", pi, false);
+      return;
+    }
+
+    if (TOOL_INVOCATION_PASSTHROUGH_RE.test(combinedLog)) {
+      // 工具参数/调用失败由核心 auto-loop 处理，这里不做 Type 分类或强行接管。
+      logLifecycle("stop_passthrough_tool_invocation", {
+        reason,
+        detail: combinedLog || "(empty)",
+      });
       return;
     }
 
