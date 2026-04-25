@@ -5,6 +5,11 @@
   "gsd": {
     "extension": true
   },
+  "scripts": {
+    "test": "node --test index.test.mjs",
+    "verify:boundaries": "node scripts/verify-boundaries.mjs",
+    "verify": "npm run test && npm run verify:boundaries"
+  },
   "pi": {
     "extensions": [
       "index.ts"
