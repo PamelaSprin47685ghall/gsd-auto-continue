@@ -31,8 +31,9 @@ interface RuntimeState {
   schemaOverloadRetries: number;
   isFixingType3: boolean;
   retryTimers: Map<ManagedRetryType, ScheduledRetryTimer>;
-  toolErrorsInCurrentTurn: number;
+  consecutiveToolErrorTurns: number;
   toolErrorGuardAbortArmed: boolean;
+  autoPauseSignalArmedForStop: boolean;
 }
 
 const PLUGIN = "gsd-auto-continue";
@@ -56,10 +57,10 @@ const MAX_TOOL_ERRORS_BEFORE_ABORT = 2;
 const ESC_PAUSE_BANNER_RE = /\b(?:auto|step)-mode paused \(escape\)\b/i;
 
 const USER_INTERVENTION_RE =
-  /stop directive detected|queued user message interrupted|manual intervention|paused \(escape\)/i;
+  /stop directive detected|queued user message interrupted|manual intervention/i;
 
-const TYPE2_RE =
-  /context overflow|auto-compaction failed|empty-turn recovery|rate.?limit|429|quota|unauthorized|overloaded|500|502|503/i;
+const TYPE2_PROVIDER_SIGNAL_RE =
+  /\bprovider error\b|\brate limited\b|\bserver error \(transient\)\b/i;
 
 const TOOL_INVOCATION_PASSTHROUGH_RE =
   /^(?!.*(?:exceeded cap|consecutive)).*(?:tool invocation failed|structured argument generation failed|validation failed for tool)/i;
@@ -67,7 +68,7 @@ const TOOL_INVOCATION_PASSTHROUGH_RE =
 const SCHEMA_OVERLOAD_RE =
   /schema overload|consecutive tool validation failures exceeded cap|consecutive turns with all tool calls failing/i;
 
-const AUTO_PAUSE_CONTEXT_RE = /auto-mode paused|paused \(escape\)|provider error/i;
+const AUTO_PAUSE_CONTEXT_RE = /(?:auto|step)-mode paused|paused \(escape\)/i;
 
 const NETWORK_RE = /network|timeout|econnreset|socket|fetch failed|stream idle/i;
 
@@ -79,8 +80,9 @@ const state: RuntimeState = {
   schemaOverloadRetries: 0,
   isFixingType3: false,
   retryTimers: new Map(),
-  toolErrorsInCurrentTurn: 0,
+  consecutiveToolErrorTurns: 0,
   toolErrorGuardAbortArmed: false,
+  autoPauseSignalArmedForStop: false,
 };
 
 type UiNotifyLevel = "info" | "warning" | "error" | "success";
@@ -218,6 +220,20 @@ function consumeStopDiagnostics(errorMessage: string): string {
   return combined;
 }
 
+function consumeAutoPauseSignalForStop(combinedLog: string): boolean {
+  if (AUTO_PAUSE_CONTEXT_RE.test(combinedLog)) {
+    state.autoPauseSignalArmedForStop = false;
+    return true;
+  }
+
+  if (state.autoPauseSignalArmedForStop) {
+    state.autoPauseSignalArmedForStop = false;
+    return true;
+  }
+
+  return false;
+}
+
 function cancelRetryTimer(retryType: ManagedRetryType, reason: string): void {
   const timer = state.retryTimers.get(retryType);
   if (!timer) return;
@@ -327,11 +343,12 @@ function scheduleRetryTimer(
 
 function standDown(reason: string, pi: ExtensionAPI, notify = false): void {
   const wasRecovering =
-    state.isFixingType3 || state.retryTimers.size > 0 || state.toolErrorGuardAbortArmed || state.toolErrorsInCurrentTurn > 0;
+    state.isFixingType3 || state.retryTimers.size > 0 || state.toolErrorGuardAbortArmed || state.consecutiveToolErrorTurns > 0;
 
   state.isFixingType3 = false;
-  state.toolErrorsInCurrentTurn = 0;
+  state.consecutiveToolErrorTurns = 0;
   state.toolErrorGuardAbortArmed = false;
+  state.autoPauseSignalArmedForStop = false;
   cancelAllRetryTimers(`${reason}:stand_down`);
   state.lastNotifications = [];
   resetRetries(`${reason}:stand_down`, true);
@@ -376,6 +393,42 @@ function safeSendUserMessage(
     return true;
   } catch (error) {
     logLifecycle(`${phase}_send_user_message_failed`, {
+      retryType,
+      attempt,
+      reason,
+      escalation,
+      detail: normalizeError(error),
+    });
+  }
+
+  const maybeSendMessage = (piApi as { sendMessage?: unknown }).sendMessage;
+  if (typeof maybeSendMessage !== "function") {
+    logLifecycle(`${phase}_trigger_turn_unavailable`, {
+      retryType,
+      attempt,
+      reason,
+      escalation,
+      detail: "sendMessage_missing",
+    });
+    return false;
+  }
+
+  try {
+    maybeSendMessage.call(
+      piApi,
+      { customType: "auto-continue-recovery", content, display: false },
+      { triggerTurn: true },
+    );
+    logLifecycle(`${phase}_trigger_turn_called`, {
+      retryType,
+      attempt,
+      reason,
+      escalation,
+      detail: "fallback_sendMessage_triggerTurn",
+    });
+    return true;
+  } catch (error) {
+    logLifecycle(`${phase}_trigger_turn_failed`, {
       retryType,
       attempt,
       reason,
@@ -455,8 +508,8 @@ function getAgentEndErrorMessage(event: { messages: unknown[] }): string {
   return "";
 }
 
-function classifyAsType2(combinedLog: string): boolean {
-  return TYPE2_RE.test(combinedLog);
+function classifyAsType2Provider(combinedLog: string): boolean {
+  return TYPE2_PROVIDER_SIGNAL_RE.test(combinedLog);
 }
 
 function classifyAsSchemaOverload(combinedLog: string): boolean {
@@ -553,6 +606,51 @@ function handleSchemaOverload(piApi: ExtensionAPI, stopReason: StopEvent["reason
   );
 }
 
+function handleType0(piApi: ExtensionAPI, stopReason: StopEvent["reason"], combinedLog: string): void {
+  cancelRetryTimersExcept("type1", "type0_enter");
+  resetRetryCount("type2", "type0_enter");
+  resetRetryCount("type3", "type0_enter");
+
+  if (state.retryTimers.has("type1")) {
+    logLifecycle("type0_continue_pending", {
+      retryType: "type1",
+      attempt: state.type1Retries,
+      reason: stopReason,
+      detail: "timer_already_scheduled",
+    });
+    return;
+  }
+
+  piApi.sendMessage({
+    customType: "system",
+    content: "🧰 [AutoContinue] Type 0 detected (tool-use/validation issue). Continuing in-session with corrected tool arguments...",
+    display: true,
+  });
+
+  scheduleRetryTimer(
+    "type1",
+    300,
+    {
+      phase: "type0_continue",
+      attempt: 0,
+      reason: stopReason,
+      detail: combinedLog || "tool_use_error",
+    },
+    () => {
+      safeSendUserMessage(
+        piApi,
+        "Continue execution from current context. The previous turn failed due to tool invocation/validation errors. Regenerate valid tool arguments and continue.",
+        {
+          phase: "type0_continue",
+          retryType: "type1",
+          attempt: 0,
+          reason: "tool_use_error",
+        },
+      );
+    },
+  );
+}
+
 function handleType3(
   piApi: ExtensionAPI,
   stopReason: StopEvent["reason"],
@@ -603,7 +701,7 @@ function handleType3(
     display: true,
   });
 
-  const prompt = `Auto-mode was paused due to a blocking issue or failed verification:\n\n${diagnosis}\n\nPlease diagnose and fix this specific issue. Use the necessary tools (e.g., edit files, resolve git conflicts, fix tests or adjust the plan). I will resume auto-mode automatically once you finish this turn. Do not ask for confirmation.`;
+  const prompt = `Auto-mode has been paused due to a blocking issue or failed verification:\n\n${diagnosis}\n\nYou are now in a manual recovery turn outside auto-mode. Please diagnose and fix this specific issue using the necessary tools (e.g., edit files, resolve git conflicts, fix tests or adjust the plan). I will resume auto-mode automatically after this recovery turn completes. Do not ask for confirmation.`;
 
   scheduleRetryTimer(
     "type3",
@@ -651,7 +749,7 @@ function handleType2(piApi: ExtensionAPI, stopReason: StopEvent["reason"], combi
     const attempt = state.type2Retries;
     piApi.sendMessage({
       customType: "system",
-      content: `⚠️ [AutoContinue] Provider/Syntax error. Type 2 restart in 5s (Attempt ${attempt}/${RETRY_LIMITS.type2})...`,
+      content: `⚠️ [AutoContinue] Type 2 detected (official provider-pause signal). Exiting auto-mode and jumping back in 5s (Attempt ${attempt}/${RETRY_LIMITS.type2})...`,
       display: true,
     });
 
@@ -743,13 +841,16 @@ function handleType1(piApi: ExtensionAPI, stopReason: StopEvent["reason"], combi
           return;
         }
 
-        const resumeCommand = getResumeCommand();
-        safeSendUserMessage(piApi, resumeCommand, {
-          phase: "type1_retry_fallback",
-          retryType: "type1",
-          attempt,
-          reason: `${reason}:retry_last_turn_fallback`,
-        });
+        safeSendUserMessage(
+          piApi,
+          "Continue execution from current context. Retry the last failed network operation without switching modes.",
+          {
+            phase: "type1_retry_fallback",
+            retryType: "type1",
+            attempt,
+            reason: `${reason}:retry_last_turn_fallback`,
+          },
+        );
       },
     );
     return;
@@ -859,25 +960,31 @@ export default async function registerExtension(pi: ExtensionAPI) {
     });
   });
 
-  pi.on("turn_start", () => {
-    state.toolErrorsInCurrentTurn = 0;
-    state.toolErrorGuardAbortArmed = false;
-  });
-
-  pi.on("tool_execution_end", (event: { isError?: boolean; toolName?: string }, ctx: ExtensionContext) => {
+  pi.on("turn_end", (event: { toolResults?: Array<{ isError?: boolean }>; turnIndex?: number }, ctx: ExtensionContext) => {
     if (state.isFixingType3) return;
-    if (!event?.isError) return;
 
-    state.toolErrorsInCurrentTurn += 1;
+    const toolResults = Array.isArray(event.toolResults) ? event.toolResults : [];
+    if (toolResults.length === 0) {
+      return;
+    }
+
+    const allToolErrors = toolResults.every((result) => result?.isError === true);
+    if (!allToolErrors) {
+      state.consecutiveToolErrorTurns = 0;
+      state.toolErrorGuardAbortArmed = false;
+      return;
+    }
+
+    state.consecutiveToolErrorTurns += 1;
 
     logLifecycle("tool_error_guard_count", {
       retryType: "type1",
-      attempt: state.toolErrorsInCurrentTurn,
-      reason: "tool_error",
-      detail: String(event.toolName || "unknown"),
+      attempt: state.consecutiveToolErrorTurns,
+      reason: "tool_error_turn",
+      detail: `turn=${event.turnIndex ?? "unknown"} toolResults=${toolResults.length}`,
     });
 
-    if (state.toolErrorsInCurrentTurn < MAX_TOOL_ERRORS_BEFORE_ABORT) {
+    if (state.consecutiveToolErrorTurns < MAX_TOOL_ERRORS_BEFORE_ABORT) {
       return;
     }
 
@@ -889,13 +996,13 @@ export default async function registerExtension(pi: ExtensionAPI) {
 
     pi.sendMessage({
       customType: "system",
-      content: "⚠️ [AutoContinue] 2 tool errors in this turn. Aborting turn early to avoid schema-overload cap, then resuming auto-mode.",
+      content: "⚠️ [AutoContinue] 2 consecutive error-only tool turns detected. Aborting now to avoid schema-overload cap, then continuing in-session.",
       display: true,
     });
 
     logLifecycle("tool_error_guard_abort_requested", {
       retryType: "type1",
-      attempt: state.toolErrorsInCurrentTurn,
+      attempt: state.consecutiveToolErrorTurns,
       reason: "tool_error_guard",
       detail: "ctx.abort",
     });
@@ -905,7 +1012,7 @@ export default async function registerExtension(pi: ExtensionAPI) {
     } catch (error) {
       logLifecycle("tool_error_guard_abort_failed", {
         retryType: "type1",
-        attempt: state.toolErrorsInCurrentTurn,
+        attempt: state.consecutiveToolErrorTurns,
         reason: "tool_error_guard",
         detail: normalizeError(error),
       });
@@ -938,7 +1045,16 @@ export default async function registerExtension(pi: ExtensionAPI) {
       detail: msg,
     });
 
+    const hasAutoPauseSignal = AUTO_PAUSE_CONTEXT_RE.test(msg);
     const isEscPauseBanner = ESC_PAUSE_BANNER_RE.test(msg);
+
+    if (hasAutoPauseSignal) {
+      state.autoPauseSignalArmedForStop = true;
+      logLifecycle("auto_pause_signal_observed", {
+        reason: kind,
+        detail: "armed_for_next_stop_turn",
+      });
+    }
 
     if (kind === "blocked" || kind === "error" || kind === "input_needed" || isEscPauseBanner) {
       rememberNotification(msg);
@@ -963,12 +1079,12 @@ export default async function registerExtension(pi: ExtensionAPI) {
     if (state.toolErrorGuardAbortArmed && reason !== "cancelled") {
       logLifecycle("tool_error_guard_abort_cleared", {
         retryType: "type1",
-        attempt: state.toolErrorsInCurrentTurn,
+        attempt: state.consecutiveToolErrorTurns,
         reason,
         detail: "non_cancelled_stop",
       });
       state.toolErrorGuardAbortArmed = false;
-      state.toolErrorsInCurrentTurn = 0;
+      state.consecutiveToolErrorTurns = 0;
     }
 
     // Type 3 修复回合结束后自动续跑。
@@ -979,7 +1095,7 @@ export default async function registerExtension(pi: ExtensionAPI) {
       const resumeCommand = getResumeCommand();
       pi.sendMessage({
         customType: "system",
-        content: "✅ [AutoContinue] Type 3 fix completed. Resuming auto-mode...",
+        content: "✅ [AutoContinue] Type 3 fix completed outside auto-mode. Resuming auto-mode...",
         display: true,
       });
 
@@ -1010,20 +1126,16 @@ export default async function registerExtension(pi: ExtensionAPI) {
     }
 
     if (TOOL_INVOCATION_PASSTHROUGH_RE.test(combinedLog)) {
-      logLifecycle("stop_passthrough_tool_invocation", {
-        reason,
-        detail: combinedLog || "(empty)",
-      });
+      handleType0(pi, reason, combinedLog);
       return;
     }
 
     if (reason === "cancelled") {
       if (state.toolErrorGuardAbortArmed) {
-        const resumeCommand = getResumeCommand();
-        const guardedAttempts = state.toolErrorsInCurrentTurn;
+        const guardedAttempts = state.consecutiveToolErrorTurns;
 
         state.toolErrorGuardAbortArmed = false;
-        state.toolErrorsInCurrentTurn = 0;
+        state.consecutiveToolErrorTurns = 0;
 
         logLifecycle("tool_error_guard_abort_observed", {
           retryType: "type1",
@@ -1036,18 +1148,22 @@ export default async function registerExtension(pi: ExtensionAPI) {
           "type1",
           300,
           {
-            phase: "tool_error_guard_resume",
+            phase: "tool_error_guard_internal_continue",
             attempt: 0,
             reason: "tool_error_guard",
-            detail: resumeCommand,
+            detail: "sendUserMessage",
           },
           () => {
-            safeSendUserMessage(pi, resumeCommand, {
-              phase: "tool_error_guard_resume",
-              retryType: "type1",
-              attempt: 0,
-              reason: "tool_error_guard",
-            });
+            safeSendUserMessage(
+              pi,
+              "Continue execution from current context. The previous turn was aborted by tool-error guard after consecutive tool failures. Read the last tool validation errors and retry with corrected arguments.",
+              {
+                phase: "tool_error_guard_internal_continue",
+                retryType: "type1",
+                attempt: 0,
+                reason: "tool_error_guard",
+              },
+            );
           },
         );
         return;
@@ -1065,6 +1181,15 @@ export default async function registerExtension(pi: ExtensionAPI) {
       return;
     }
 
+    const hasAutoPauseSignal = consumeAutoPauseSignalForStop(combinedLog);
+    if (!hasAutoPauseSignal && !state.isFixingType3) {
+      logLifecycle("stop_passthrough_no_recent_auto_pause", {
+        reason,
+        detail: "pause_signal_missing_for_this_stop_turn",
+      });
+      return;
+    }
+
     // ==========================================
     // Decision chain: schema-overload -> network(T1) -> transient(T2) -> fallback(T3)
     // ==========================================
@@ -1079,7 +1204,7 @@ export default async function registerExtension(pi: ExtensionAPI) {
       return;
     }
 
-    if (classifyAsType2(combinedLog)) {
+    if (classifyAsType2Provider(combinedLog)) {
       handleType2(pi, reason, combinedLog);
       return;
     }

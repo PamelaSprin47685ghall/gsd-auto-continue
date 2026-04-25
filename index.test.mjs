@@ -69,13 +69,18 @@ test("resets retry counters on class switches and preserves type3 escalation pat
   assert.match(source, /escalation:\s*"type2_to_type3"/);
 });
 
-test("guards retryLastTurn fallback with explicit safe path and no triggerTurn misuse", () => {
+test("guards retryLastTurn fallback with robust user-message dispatch fallback and no triggerTurn misuse", () => {
   assert.match(source, /function safeRetryLastTurn\(/);
   assert.match(source, /retryLastTurn_missing/);
   assert.match(source, /retry_last_turn_fallback/);
   assert.match(source, /safeSendUserMessage\(piApi, resumeCommand/);
 
-  assert.equal(source.includes("triggerTurn"), false, "sendUserMessage no longer accepts triggerTurn");
+  assert.match(source, /const maybeSendMessage = \(piApi as \{ sendMessage\?: unknown \}\)\.sendMessage/);
+  assert.match(source, /_trigger_turn_unavailable/);
+  assert.match(source, /_trigger_turn_called/);
+  assert.match(source, /fallback_sendMessage_triggerTurn/);
+
+  assert.equal(source.includes("triggerTurn"), true, "sendMessage fallback should trigger a turn when sendUserMessage fails");
 });
 
 test("hijacks schema-overload at agent_end to force in-session transient retry path", () => {
@@ -88,23 +93,62 @@ test("hijacks schema-overload at agent_end to force in-session transient retry p
   assert.match(source, /logLifecycle\("agent_end_schema_overload_hijack"/);
 });
 
-test("aborts a turn after 2 tool errors and auto-resumes on cancelled stop", () => {
+test("does not classify escape pause banner as user intervention", () => {
+  assert.match(source, /const ESC_PAUSE_BANNER_RE =/);
+  assert.match(source, /const USER_INTERVENTION_RE =/);
+  assert.match(source, /stop directive detected\|queued user message interrupted\|manual intervention/);
+  assert.equal(source.includes("manual intervention|paused \\(escape\\)"), false);
+});
+
+test("requires auto/step pause signal in the current stop turn before stop recovery decision chain", () => {
+  assert.match(source, /autoPauseSignalArmedForStop: boolean/);
+  assert.match(source, /function consumeAutoPauseSignalForStop\(/);
+  assert.equal(
+    source.includes("const AUTO_PAUSE_CONTEXT_RE = /(?:auto|step)-mode paused|paused \\(escape\\)/i;"),
+    true,
+  );
+  assert.match(source, /const hasAutoPauseSignal = consumeAutoPauseSignalForStop\(combinedLog\)/);
+  assert.match(source, /if \(!hasAutoPauseSignal && !state\.isFixingType3\) \{/);
+  assert.match(source, /stop_passthrough_no_recent_auto_pause/);
+});
+
+test("classifies Type2 only by official provider-pause terms; non-provider falls to Type3", () => {
+  assert.match(source, /const TYPE2_PROVIDER_SIGNAL_RE =/);
+  assert.equal(source.includes("provider error"), true);
+  assert.equal(source.includes("rate limited"), true);
+  assert.equal(source.includes("server error \\(transient\\)"), true);
+  assert.match(source, /function classifyAsType2Provider\(/);
+  assert.match(source, /if \(classifyAsType2Provider\(combinedLog\)\) \{/);
+});
+
+test("routes tool-invocation errors to Type0 in-session continue", () => {
+  assert.match(source, /if \(TOOL_INVOCATION_PASSTHROUGH_RE\.test\(combinedLog\)\) \{/);
+  assert.match(source, /handleType0\(pi, reason, combinedLog\)/);
+  assert.match(source, /function handleType0\(/);
+  assert.match(source, /Type 0 detected \(tool-use\/validation issue\)/);
+  assert.match(source, /phase: "type0_continue"/);
+});
+
+test("aborts after 2 consecutive error-only tool turns and continues via real next-turn user message", () => {
   assert.match(source, /const MAX_TOOL_ERRORS_BEFORE_ABORT = 2/);
-  assert.match(source, /toolErrorsInCurrentTurn: number/);
+  assert.match(source, /consecutiveToolErrorTurns: number/);
   assert.match(source, /toolErrorGuardAbortArmed: boolean/);
 
-  assert.match(source, /pi\.on\("turn_start", \(\) => \{/);
-  assert.match(source, /pi\.on\("tool_execution_end", \(event: \{ isError\?: boolean; toolName\?: string \}, ctx: ExtensionContext\) => \{/);
-  assert.match(source, /state\.toolErrorsInCurrentTurn \+= 1/);
-  assert.match(source, /if \(state\.toolErrorsInCurrentTurn < MAX_TOOL_ERRORS_BEFORE_ABORT\)/);
+  assert.match(source, /pi\.on\("turn_end", \(event: \{ toolResults\?: Array<\{ isError\?: boolean \}>; turnIndex\?: number \}, ctx: ExtensionContext\) => \{/);
+  assert.match(source, /const allToolErrors = toolResults\.every\(\(result\) => result\?\.isError === true\)/);
+  assert.match(source, /state\.consecutiveToolErrorTurns \+= 1/);
+  assert.match(source, /if \(state\.consecutiveToolErrorTurns < MAX_TOOL_ERRORS_BEFORE_ABORT\)/);
   assert.match(source, /state\.toolErrorGuardAbortArmed = true/);
   assert.match(source, /ctx\.abort\(\)/);
   assert.match(source, /logLifecycle\("tool_error_guard_abort_requested"/);
 
   assert.match(source, /if \(reason === "cancelled"\) \{/);
   assert.match(source, /if \(state\.toolErrorGuardAbortArmed\) \{/);
-  assert.match(source, /phase: "tool_error_guard_resume"/);
-  assert.match(source, /safeSendUserMessage\(pi, resumeCommand/);
+  assert.match(source, /phase: "tool_error_guard_internal_continue"/);
+  assert.match(source, /safeSendUserMessage\(\s*pi,\s*"Continue execution from current context\./);
+  assert.equal(source.includes("tool_error_guard_internal_retry"), false);
+  assert.equal(source.includes("tool_error_guard_internal_retry_fallback"), false);
+  assert.equal(source.includes("tool_error_guard_resume"), false);
 });
 
 test("forbids command-recognition, auto-lock and mode-branch heuristics", () => {
