@@ -9,10 +9,17 @@ export const CONTINUATION_POLICY = {
 
 export const WITHOUT_CONTEXT_STOP_PHRASES = ["auto-mode paused", "step-mode paused", "paused (escape)"];
 
-export const MANUAL_INTERVENTION_PHRASES = [
-  "stop directive detected",
-  "queued user message interrupted",
-  "manual intervention",
-  "user interruption",
-  "operator intervention",
+type ManualInterventionRule = readonly RegExp[];
+
+export const MANUAL_INTERVENTION_RULES: readonly ManualInterventionRule[] = [
+  [/\b(?:stop|backtrack)\b/i, /\bdirective\b/i],
+  [/\bqueued\b/i, /\buser message\b/i],
+  [/\b(?:manual|human|operator)\b/i, /\b(?:intervention|review|action|input|required|needed)\b/i],
+  [/\bpaus(?:e|ed|ing)\b/i, /\b(?:manual|human|operator)\b/i],
+  [/\buser\b/i, /\b(?:interruption|interrupted|requested stop|cancelled|canceled)\b/i],
 ];
+
+export const matchesManualIntervention = (text: string) => {
+  const detail = text.trim();
+  return detail.length > 0 && MANUAL_INTERVENTION_RULES.some((rule) => rule.every((pattern) => pattern.test(detail)));
+};
