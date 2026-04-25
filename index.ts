@@ -9,7 +9,6 @@ import type {
   StopEvent,
 } from "@gsd/pi-coding-agent";
 
-type ManagedMode = "inactive" | "auto" | "step";
 type RetryType = "none" | "type1" | "type2" | "type3";
 type ManagedRetryType = Exclude<RetryType, "none">;
 type EscalationType = "none" | "type1_to_type2" | "type2_to_type3";
@@ -25,7 +24,6 @@ interface ScheduledRetryTimer {
 }
 
 interface RuntimeState {
-  mode: ManagedMode;
   lastNotifications: string[];
   type1Retries: number;
   type2Retries: number;
@@ -52,8 +50,6 @@ const SCHEMA_OVERLOAD_MAX_RETRIES =
     ? SCHEMA_OVERLOAD_MAX_RETRIES_RAW
     : 0;
 
-const AUTO_MODE_STARTED_RE = /\bauto-mode (started|resumed)\b/i;
-const STEP_MODE_STARTED_RE = /\bstep-mode (started|resumed)\b/i;
 const ESC_PAUSE_BANNER_RE = /\b(?:auto|step)-mode paused \(escape\)\b/i;
 
 const USER_INTERVENTION_RE =
@@ -71,7 +67,6 @@ const SCHEMA_OVERLOAD_RE =
 const NETWORK_RE = /network|timeout|econnreset|socket|fetch failed|stream idle/i;
 
 const state: RuntimeState = {
-  mode: "inactive",
   lastNotifications: [],
   type1Retries: 0,
   type2Retries: 0,
@@ -138,7 +133,6 @@ function logLifecycle(
     retryType,
     attempt,
     reason,
-    mode: state.mode,
     fixingType3: state.isFixingType3,
   };
 
@@ -324,38 +318,20 @@ function scheduleRetryTimer(
   });
 }
 
-function transitionMode(next: ManagedMode, reason: string): void {
-  if (state.mode === next) {
-    logLifecycle("mode_noop", { reason, detail: `mode=${next}` });
-    return;
-  }
+function standDown(reason: string, pi: ExtensionAPI, notify = false): void {
+  const wasRecovering = state.isFixingType3 || state.retryTimers.size > 0;
 
-  const previous = state.mode;
-  state.mode = next;
+  state.isFixingType3 = false;
+  cancelAllRetryTimers(`${reason}:stand_down`);
+  state.lastNotifications = [];
+  resetRetries(`${reason}:stand_down`, true);
 
-  logLifecycle("mode_transition", {
+  logLifecycle("recovery_stood_down", {
     reason,
-    detail: `${previous} -> ${next}`,
+    detail: `wasRecovering=${wasRecovering ? "yes" : "no"}`,
   });
 
-  if (next === "inactive") {
-    state.isFixingType3 = false;
-    cancelAllRetryTimers(`${reason}:inactive`);
-    state.lastNotifications = [];
-    resetRetries(`${reason}:inactive`, true);
-    return;
-  }
-
-  cancelAllRetryTimers(`${reason}:active_boundary`);
-  state.lastNotifications = [];
-  resetRetries(`${reason}:active`, true);
-}
-
-function standDown(reason: string, pi: ExtensionAPI, notify = false): void {
-  const wasActive = state.mode !== "inactive" || state.isFixingType3;
-  transitionMode("inactive", reason);
-
-  if (notify && wasActive) {
+  if (notify && wasRecovering) {
     pi.sendMessage({
       customType: "system",
       content: "ℹ️ [AutoContinue] User/manual intervention detected. Auto-recovery stood down.",
@@ -364,8 +340,8 @@ function standDown(reason: string, pi: ExtensionAPI, notify = false): void {
   }
 }
 
-function resumeCommandForMode(mode: ManagedMode): string {
-  return mode === "step" ? "/gsd next" : "/gsd auto";
+function getResumeCommand(): string {
+  return "/gsd auto";
 }
 
 function safeSendUserMessage(
@@ -582,7 +558,7 @@ function handleType3(
     display: true,
   });
 
-  const prompt = `Auto-mode was paused due to a blocking issue or failed verification:\n\n${diagnosis}\n\nPlease diagnose and fix this specific issue. Use the necessary tools (e.g., edit files, resolve git conflicts, fix tests or adjust the plan). I will resume auto/step mode automatically once you finish this turn. Do not ask for confirmation.`;
+  const prompt = `Auto-mode was paused due to a blocking issue or failed verification:\n\n${diagnosis}\n\nPlease diagnose and fix this specific issue. Use the necessary tools (e.g., edit files, resolve git conflicts, fix tests or adjust the plan). I will resume auto-mode automatically once you finish this turn. Do not ask for confirmation.`;
 
   scheduleRetryTimer(
     "type3",
@@ -622,7 +598,7 @@ function handleType2(piApi: ExtensionAPI, stopReason: StopEvent["reason"], combi
     return;
   }
 
-  const resumeCommand = resumeCommandForMode(state.mode);
+  const resumeCommand = getResumeCommand();
 
   if (state.type2Retries < RETRY_LIMITS.type2) {
     state.type2Retries += 1;
@@ -722,7 +698,7 @@ function handleType1(piApi: ExtensionAPI, stopReason: StopEvent["reason"], combi
           return;
         }
 
-        const resumeCommand = resumeCommandForMode(state.mode);
+        const resumeCommand = getResumeCommand();
         safeSendUserMessage(piApi, resumeCommand, {
           phase: "type1_retry_fallback",
           retryType: "type1",
@@ -736,7 +712,7 @@ function handleType1(piApi: ExtensionAPI, stopReason: StopEvent["reason"], combi
 
   resetRetryCount("type1", "type1_exhausted", true);
 
-  const resumeCommand = resumeCommandForMode(state.mode);
+  const resumeCommand = getResumeCommand();
   const attempt = Math.min(state.type2Retries + 1, RETRY_LIMITS.type2);
   state.type2Retries = attempt;
 
@@ -779,7 +755,7 @@ export default async function registerExtension(pi: ExtensionAPI) {
     logLifecycle("hook_session_start", { reason: "session_start" });
     pi.sendMessage({
       customType: "system",
-      content: "🚀 [AutoContinue] Verbose lifecycle mode enabled. Waiting for auto/step-mode boundaries...",
+      content: "🚀 [AutoContinue] Verbose lifecycle mode enabled. Waiting for stop/error recovery signals...",
       display: true,
     });
   });
@@ -790,10 +766,10 @@ export default async function registerExtension(pi: ExtensionAPI) {
       detail: event.sessionFile,
     });
 
-    if (event.reason === "programmatic" && (state.mode !== "inactive" || state.isFixingType3)) {
-      logLifecycle("session_end_mode_preserved", {
+    if (event.reason === "programmatic" && (state.isFixingType3 || state.retryTimers.size > 0)) {
+      logLifecycle("session_end_recovery_preserved", {
         reason: "session_end:programmatic",
-        detail: "auto_mode_new_session_boundary",
+        detail: "recovery_pipeline_continues_across_session_boundary",
       });
       return;
     }
@@ -807,7 +783,7 @@ export default async function registerExtension(pi: ExtensionAPI) {
   });
 
   pi.on("before_agent_start", (_event: BeforeAgentStartEvent) => {
-    // Mode boundaries are sourced from notification lifecycle and persisted state.
+    // Reserved hook for future pre-turn recovery context wiring.
   });
 
   pi.on("input", (event: InputEvent) => {
@@ -816,16 +792,16 @@ export default async function registerExtension(pi: ExtensionAPI) {
     const text = String(event.text || "").trim();
     if (!text) return;
 
-    if (state.mode !== "inactive" && !state.isFixingType3) {
+    if (state.retryTimers.size > 0 && !state.isFixingType3) {
       logLifecycle("hook_input_manual_intervention", {
-        reason: "interactive_input_while_mode_active",
+        reason: "interactive_input_while_recovery_active",
         detail: text,
       });
       standDown("interactive_input", pi, true);
     }
   });
 
-  // 持续收集 GSD 内部发出的 Notification，以精准捕获模式切换信号
+  // 持续收集 GSD 内部发出的 Notification，作为 stop 时诊断拼接输入
   pi.on("notification", (event: NotificationEvent) => {
     const msg = String(event.message || "");
     const kind = event.kind || "error";
@@ -834,16 +810,6 @@ export default async function registerExtension(pi: ExtensionAPI) {
       reason: kind,
       detail: msg,
     });
-
-    if (AUTO_MODE_STARTED_RE.test(msg)) {
-      transitionMode("auto", "notification:auto_started_or_resumed");
-      return;
-    }
-
-    if (STEP_MODE_STARTED_RE.test(msg)) {
-      transitionMode("step", "notification:step_started_or_resumed");
-      return;
-    }
 
     const isEscPauseBanner = ESC_PAUSE_BANNER_RE.test(msg);
 
@@ -867,15 +833,15 @@ export default async function registerExtension(pi: ExtensionAPI) {
       detail: combinedLog || "(empty)",
     });
 
-    // Type 3 修复回合结束，按进入时模式恢复。
+    // Type 3 修复回合结束后自动续跑。
     if (state.isFixingType3 && reason === "completed") {
       state.isFixingType3 = false;
       resetRetries("type3_fix_completed", true);
 
-      const resumeCommand = resumeCommandForMode(state.mode);
+      const resumeCommand = getResumeCommand();
       pi.sendMessage({
         customType: "system",
-        content: `✅ [AutoContinue] Type 3 fix completed. Resuming ${state.mode === "step" ? "Step" : "Auto"}-mode...`,
+        content: "✅ [AutoContinue] Type 3 fix completed. Resuming auto-mode...",
         display: true,
       });
 
@@ -901,13 +867,11 @@ export default async function registerExtension(pi: ExtensionAPI) {
     }
 
     if (reason === "completed") {
-      // GSD 正常完成当前自动化阶段，退出托管模式。
       standDown("stop:completed", pi, false);
       return;
     }
 
     if (TOOL_INVOCATION_PASSTHROUGH_RE.test(combinedLog)) {
-      // 工具参数/调用失败由核心 auto-loop 处理，这里不做 Type 分类或强行接管。
       logLifecycle("stop_passthrough_tool_invocation", {
         reason,
         detail: combinedLog || "(empty)",
@@ -916,34 +880,10 @@ export default async function registerExtension(pi: ExtensionAPI) {
     }
 
     if (reason === "cancelled") {
-      // 取消通常意味着人工介入或显式中止，直接撤防。
       standDown("stop:cancelled", pi, true);
       return;
     }
 
-    if (state.mode === "inactive" && reason === "error") {
-      const recoverableSignature =
-        classifyAsSchemaOverload(combinedLog) || NETWORK_RE.test(combinedLog) || classifyAsType2(combinedLog);
-
-      if (recoverableSignature) {
-        transitionMode("auto", "stop:error_signature_bootstrap");
-        logLifecycle("mode_bootstrap_from_stop_error", {
-          reason,
-          detail: combinedLog || "(empty)",
-        });
-      }
-    }
-
-    // 2. 模式过滤：只在托管模式下介入
-    if (state.mode === "inactive") {
-      logLifecycle("stop_ignored", {
-        reason,
-        detail: "mode_inactive",
-      });
-      return;
-    }
-
-    // Exclude: 用户主动介入 (绝不恢复)
     if (USER_INTERVENTION_RE.test(combinedLog)) {
       logLifecycle("stop_stand_down_user_intervention", {
         reason,

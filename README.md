@@ -1,6 +1,6 @@
 # GSD Auto Continue
 
-A robust error-recovery extension for GSD that ensures `auto-mode` stays automatic. It classifies failures into three tiers and applies specific recovery strategies, minimizing manual intervention.
+A robust error-recovery extension for GSD that keeps `auto-mode` moving. It classifies failures into three tiers and adds a dedicated schema-overload continuation path so core guardrails do not permanently kill automation.
 
 ## 🚀 Recovery Tiers
 
@@ -19,6 +19,11 @@ A robust error-recovery extension for GSD that ensures `auto-mode` stays automat
 *   **Symptoms**: Failed pre/post-execution checks, verification gate failures, UAT blocks, or git conflicts.
 *   **Strategy**: Escalates to the LLM with a diagnostic prompt. The agent is instructed to fix the root cause (e.g., edit files, resolve conflicts). Auto-mode resumes automatically once the fix turn completes.
 *   **Limit**: 3 attempts.
+
+### Schema-Overload Continuation (core 3x tool-validation cap)
+*   **Symptoms**: `Schema overload: consecutive tool validation failures exceeded cap` or `consecutive turns with all tool calls failing`.
+*   **Strategy**: No `/gsd auto` restart. The plugin schedules in-place `retryLastTurn` so context stays hot and auto-loop does not die on the first 3x cap event.
+*   **Limit**: Unlimited by default. Optional cap via `GSD_AUTO_CONTINUE_SCHEMA_OVERLOAD_MAX_RETRIES` (>0 enables cap).
 
 ## 🛠 Installation
 

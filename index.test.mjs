@@ -22,8 +22,7 @@ test("avoids unsafe sendMessage/sendUserMessage calls during factory init", () =
   assert.equal(/pi\.sendUserMessage\(/.test(preHookSlice), false, "sendUserMessage before lifecycle hook registration is unsafe");
 });
 
-test("tracks explicit mode boundaries plus structured lifecycle diagnostics", () => {
-  assert.match(source, /type ManagedMode = "inactive" \| "auto" \| "step"/);
+test("keeps structured lifecycle diagnostics without mode-state dependency", () => {
   assert.match(source, /plugin:\s*PLUGIN/);
   assert.match(source, /phase,/);
   assert.match(source, /retryType,/);
@@ -38,6 +37,10 @@ test("tracks explicit mode boundaries plus structured lifecycle diagnostics", ()
   assert.match(source, /logLifecycle\("timer_cancel"/);
   assert.match(source, /`\$\{phase\}_scheduled`/);
   assert.match(source, /`\$\{phase\}_fired`/);
+
+  assert.equal(source.includes("type ManagedMode"), false);
+  assert.equal(source.includes("state.mode"), false);
+  assert.equal(source.includes("transitionMode("), false);
 });
 
 test("uses unified cancellable timer management for type1/type2/type3 retries", () => {
@@ -82,7 +85,6 @@ test("adds schema-overload continuation path with in-place retryLastTurn", () =>
   assert.match(source, /schema_overload_retry/);
   assert.match(source, /Core schema-overload cap hit\. In-place retryLastTurn/);
   assert.match(source, /if \(classifyAsSchemaOverload\(combinedLog\)\)/);
-  assert.equal(source.includes("/gsd auto"), true, "other paths may still use /gsd auto");
 });
 
 test("keeps stop handling simple: no custom-step soft-continue branch", () => {
@@ -93,7 +95,7 @@ test("keeps stop handling simple: no custom-step soft-continue branch", () => {
   assert.match(source, /stop_passthrough_tool_invocation/);
 });
 
-test("forbids command-recognition and auto-lock heuristics; uses stop-error signature bootstrap", () => {
+test("forbids command-recognition, auto-lock and mode-branch heuristics", () => {
   assert.equal(source.includes("AUTO_MODE_COMMAND_RE"), false);
   assert.equal(source.includes("STEP_MODE_COMMAND_RE"), false);
   assert.equal(source.includes("STAND_DOWN_COMMAND_RE"), false);
@@ -103,11 +105,12 @@ test("forbids command-recognition and auto-lock heuristics; uses stop-error sign
   assert.equal(source.includes("recoverModeFromSessionLock"), false);
   assert.equal(source.includes("existsSync("), false);
 
-  assert.match(source, /event\.reason === "programmatic" && \(state\.mode !== "inactive" \|\| state\.isFixingType3\)/);
-  assert.match(source, /logLifecycle\("session_end_mode_preserved"/);
+  assert.equal(source.includes("AUTO_MODE_STARTED_RE"), false);
+  assert.equal(source.includes("STEP_MODE_STARTED_RE"), false);
+  assert.equal(source.includes("stop:error_signature_bootstrap"), false);
+  assert.equal(source.includes("mode_bootstrap_from_stop_error"), false);
+  assert.equal(source.includes("mode_inactive"), false);
 
-  assert.match(source, /if \(state\.mode === "inactive" && reason === "error"\)/);
-  assert.match(source, /classifyAsSchemaOverload\(combinedLog\) \|\| NETWORK_RE\.test\(combinedLog\) \|\| classifyAsType2\(combinedLog\)/);
-  assert.match(source, /transitionMode\("auto", "stop:error_signature_bootstrap"\)/);
-  assert.match(source, /logLifecycle\("mode_bootstrap_from_stop_error"/);
+  assert.equal(source.includes("/gsd next"), false);
+  assert.equal(source.includes('return "/gsd auto"'), true);
 });
