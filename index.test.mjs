@@ -93,7 +93,7 @@ test("keeps stop handling simple: no custom-step soft-continue branch", () => {
   assert.match(source, /stop_passthrough_tool_invocation/);
 });
 
-test("forbids command-recognition and auto-lock heuristics; keeps programmatic session-end preservation", () => {
+test("forbids command-recognition and auto-lock heuristics; uses stop-error signature bootstrap", () => {
   assert.equal(source.includes("AUTO_MODE_COMMAND_RE"), false);
   assert.equal(source.includes("STEP_MODE_COMMAND_RE"), false);
   assert.equal(source.includes("STAND_DOWN_COMMAND_RE"), false);
@@ -105,4 +105,9 @@ test("forbids command-recognition and auto-lock heuristics; keeps programmatic s
 
   assert.match(source, /event\.reason === "programmatic" && \(state\.mode !== "inactive" \|\| state\.isFixingType3\)/);
   assert.match(source, /logLifecycle\("session_end_mode_preserved"/);
+
+  assert.match(source, /if \(state\.mode === "inactive" && reason === "error"\)/);
+  assert.match(source, /classifyAsSchemaOverload\(combinedLog\) \|\| NETWORK_RE\.test\(combinedLog\) \|\| classifyAsType2\(combinedLog\)/);
+  assert.match(source, /transitionMode\("auto", "stop:error_signature_bootstrap"\)/);
+  assert.match(source, /logLifecycle\("mode_bootstrap_from_stop_error"/);
 });

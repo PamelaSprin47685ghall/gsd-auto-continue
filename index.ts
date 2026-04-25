@@ -921,6 +921,19 @@ export default async function registerExtension(pi: ExtensionAPI) {
       return;
     }
 
+    if (state.mode === "inactive" && reason === "error") {
+      const recoverableSignature =
+        classifyAsSchemaOverload(combinedLog) || NETWORK_RE.test(combinedLog) || classifyAsType2(combinedLog);
+
+      if (recoverableSignature) {
+        transitionMode("auto", "stop:error_signature_bootstrap");
+        logLifecycle("mode_bootstrap_from_stop_error", {
+          reason,
+          detail: combinedLog || "(empty)",
+        });
+      }
+    }
+
     // 2. 模式过滤：只在托管模式下介入
     if (state.mode === "inactive") {
       logLifecycle("stop_ignored", {
