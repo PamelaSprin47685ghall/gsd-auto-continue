@@ -7,6 +7,7 @@ import type {
   SessionEndEvent,
   StopEvent,
 } from "@gsd/pi-coding-agent";
+import { OFFICIAL_AUTO_EXIT_PHRASES } from "./config.ts";
 import { getAgentEndErrorMessage, getStopErrorMessage } from "./recovery.ts";
 import type { createRecoveryOperations } from "./recovery.ts";
 import { consumeStopDiagnostics, rememberNotification } from "./runtime-state.ts";
@@ -23,6 +24,11 @@ export interface LifecycleRuntimeContext {
 
 export function registerLifecycleHooks(pi: ExtensionAPI, runtimeContext: LifecycleRuntimeContext): void {
   const { state, config, diagnostics, recovery } = runtimeContext;
+
+  function containsAnyPhrase(text: string, phrases: readonly string[]): boolean {
+    const normalized = text.toLowerCase();
+    return phrases.some((phrase) => normalized.includes(phrase));
+  }
 
   pi.on("session_start", (_event, ctx) => {
     diagnostics.bindUiNotifier(ctx);
@@ -95,6 +101,13 @@ export function registerLifecycleHooks(pi: ExtensionAPI, runtimeContext: Lifecyc
       reason: kind,
       detail: message,
     });
+
+    if (containsAnyPhrase(message, OFFICIAL_AUTO_EXIT_PHRASES)) {
+      diagnostics.logLifecycle("official_auto_mode_exit_observed", {
+        reason: kind,
+        detail: "current_stop_diagnostic_only",
+      });
+    }
 
     if (kind === "blocked" || kind === "error" || kind === "input_needed" || message.trim()) {
       rememberNotification(state, message, config.maxNotifications);

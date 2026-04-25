@@ -167,6 +167,22 @@ function findTriggerTurnMessage(harness) {
   return harness.sendMessageCalls.find((call) => call.options?.triggerTurn === true);
 }
 
+async function exhaustManualType1(harness, context, startAttempt, detailPrefix) {
+  for (let attempt = startAttempt; attempt <= 10; attempt += 1) {
+    await stopWith(harness, context, "error", `${detailPrefix} attempt ${attempt}`);
+    assert.equal(latestDiagnostic(context, "type1_preserve_context_scheduled").attempt, attempt);
+    await harness.timers.flushNextTimer();
+  }
+
+  await stopWith(harness, context, "error", `${detailPrefix} after Type 1 budget`);
+}
+
+function assertNoAutoModeResume(harness, context) {
+  assert.equal(diagnosticsFor(context, "type2_discard_context_scheduled").length, 0);
+  assert.equal(diagnosticsFor(context, "type2_resume_auto_scheduled").length, 0);
+  assert.equal(harness.sendUserMessageCalls.some((call) => call.content === "/gsd auto"), false);
+}
+
 test("registers lifecycle hooks through a quiet factory", async (t) => {
   const harness = await createHarness(t);
 
@@ -206,7 +222,7 @@ test("Type 1 preserve-context recovery handles transient errors without auto-pau
   assert.equal(pending.length, 1);
   assert.equal(pending[0].delayMs, Math.round(1000 * 60 ** (1 / 10)));
   assert.match(harness.sendMessageCalls.at(-1).message.content, /Type 1 preserve-context retry/);
-  assert.equal(latestDiagnostic(context, "type1_preserve_context_scheduled").reason, "preserve_context_signal");
+  assert.equal(latestDiagnostic(context, "type1_preserve_context_scheduled").reason, "failure");
 
   await harness.timers.flushNextTimer();
 
@@ -226,35 +242,96 @@ test("schema-overload is treated as Type 1 and stays in-place", async (t) => {
   await emitNotification(harness, context, "Schema overload: consecutive tool validation failures exceeded cap");
   await stopWith(harness, context, "error", "consecutive turns with all tool calls failing");
 
-  assert.equal(latestDiagnostic(context, "type1_preserve_context_scheduled").reason, "schema_overload");
+  assert.equal(latestDiagnostic(context, "type1_preserve_context_scheduled").reason, "failure");
   await harness.timers.flushNextTimer();
 
   assert.equal(harness.retryLastTurnCalls.length, 0);
-  assert.match(harness.sendUserMessageCalls[0].content, /schema_overload/);
+  assert.match(harness.sendUserMessageCalls[0].content, /consecutive tool validation failures exceeded cap/);
   assert.notEqual(harness.sendUserMessageCalls[0].content.trim(), "/gsd auto");
 });
 
-test("Type 1 retry budget is 10 attempts and then escalates to unlimited Type 2 loop", async (t) => {
+test("official auto-mode exit goes directly to Type 2 because hot context is already gone", async (t) => {
   const harness = await createHarness(t);
   const context = createMockContext();
 
   await startSession(harness, context);
+  await emitNotification(harness, context, "auto-mode paused after failed post-execution check");
+  await stopWith(harness, context, "blocked", "post-execution check failed");
 
-  for (let attempt = 1; attempt <= 10; attempt += 1) {
-    await stopWith(harness, context, "error", `fetch failed transient attempt ${attempt}`);
-    assert.equal(latestDiagnostic(context, "type1_preserve_context_scheduled").attempt, attempt);
-    assert.equal(harness.timers.pendingTimers()[0].delayMs, Math.min(60_000, Math.round(1000 * 60 ** (attempt / 10))));
-    await harness.timers.flushNextTimer();
-  }
+  assert.equal(diagnosticsFor(context, "type1_preserve_context_scheduled").length, 0);
+  assert.equal(latestDiagnostic(context, "official_auto_mode_exit_observed").detail, "current_stop_diagnostic_only");
+  assert.equal(latestDiagnostic(context, "official_auto_mode_exit_consumed").retryType, "type2");
+  assert.equal(latestDiagnostic(context, "type2_discard_context_scheduled").reason, "official_auto_mode_exit");
+  assert.match(harness.sendMessageCalls.at(-1).message.content, /Loop 1\/unlimited/);
+});
 
-  await stopWith(harness, context, "error", "fetch failed after Type 1 budget");
+test("tool-error guard cancellation still uses Type 1 even if an official pause banner is observed", async (t) => {
+  const harness = await createHarness(t);
+  const context = createMockContext();
+
+  await startSession(harness, context);
+  await harness.getHandler("turn_end")({ type: "turn_end", turnIndex: 1, toolResults: [{ isError: true }] }, context.ctx);
+  await harness.getHandler("turn_end")({ type: "turn_end", turnIndex: 2, toolResults: [{ isError: true }] }, context.ctx);
+  await emitNotification(harness, context, "auto-mode paused after tool validation failures");
+  await stopWith(harness, context, "cancelled");
+
+  assert.equal(context.abortCalls.length, 1);
+  assert.equal(latestDiagnostic(context, "type1_preserve_context_scheduled").reason, "tool_error_guard");
+  assert.equal(diagnosticsFor(context, "type2_discard_context_scheduled").length, 0);
+});
+
+test("manual-mode Type 1 exhaustion gives up without Type 2 or /gsd auto", async (t) => {
+  const harness = await createHarness(t);
+  const context = createMockContext();
+
+  await startSession(harness, context);
+  await exhaustManualType1(harness, context, 1, "fetch failed transient");
 
   assert.equal(latestDiagnostic(context, "retry_reset").reason, "type1_exhausted");
-  const type2 = latestDiagnostic(context, "type2_discard_context_scheduled");
-  assert.equal(type2.retryType, "type2");
-  assert.equal(type2.attempt, 1);
-  assert.equal(type2.reason, "type1_exhausted");
-  assert.match(harness.sendMessageCalls.at(-1).message.content, /Loop 1\/unlimited/);
+  assert.equal(latestDiagnostic(context, "type1_exhausted_stand_down").retryType, "type1");
+  assertNoAutoModeResume(harness, context);
+  assert.match(harness.sendMessageCalls.at(-1).message.content, /manual intervention required/);
+});
+
+test("manual-mode network, tool, and database failures never enter Type 2 or /gsd auto", async (t) => {
+  await t.test("network", async (t) => {
+    const harness = await createHarness(t);
+    const context = createMockContext();
+
+    await startSession(harness, context);
+    await exhaustManualType1(harness, context, 1, "network fetch failed");
+
+    assert.equal(latestDiagnostic(context, "type1_exhausted_stand_down").reason, "failure");
+    assertNoAutoModeResume(harness, context);
+  });
+
+  await t.test("database", async (t) => {
+    const harness = await createHarness(t);
+    const context = createMockContext();
+
+    await startSession(harness, context);
+    await exhaustManualType1(harness, context, 1, "database corruption detected");
+
+    assert.equal(latestDiagnostic(context, "type1_exhausted_stand_down").reason, "failure");
+    assertNoAutoModeResume(harness, context);
+  });
+
+  await t.test("tool", async (t) => {
+    const harness = await createHarness(t);
+    const context = createMockContext();
+
+    await startSession(harness, context);
+    await harness.getHandler("turn_end")({ type: "turn_end", turnIndex: 1, toolResults: [{ isError: true }] }, context.ctx);
+    await harness.getHandler("turn_end")({ type: "turn_end", turnIndex: 2, toolResults: [{ isError: true }] }, context.ctx);
+    await stopWith(harness, context, "cancelled");
+    assert.equal(latestDiagnostic(context, "type1_preserve_context_scheduled").reason, "tool_error_guard");
+    await harness.timers.flushNextTimer();
+
+    await exhaustManualType1(harness, context, 2, "tool validation failed");
+
+    assert.equal(latestDiagnostic(context, "type1_exhausted_stand_down").reason, "failure");
+    assertNoAutoModeResume(harness, context);
+  });
 });
 
 test("tool-call error guard aborts on the second all-error turn and retries next turn as Type 1", async (t) => {
@@ -278,26 +355,27 @@ test("tool-call error guard aborts on the second all-error turn and retries next
   assert.match(harness.sendUserMessageCalls[0].content, /Two consecutive tool-call turns/);
 });
 
-test("Type 2 handles non-Type-1 blockers, resumes auto-mode after the fix turn, and loops without a cap", async (t) => {
+test("official auto-mode exits use Type 2 and resume auto-mode for each current paused failure", async (t) => {
   const harness = await createHarness(t);
   const context = createMockContext();
 
   await startSession(harness, context);
+  await emitNotification(harness, context, "auto-mode paused after git conflict in generated summary file");
   await stopWith(harness, context, "blocked", "git conflict in generated summary file");
 
   assert.equal(latestDiagnostic(context, "type2_discard_context_scheduled").attempt, 1);
   assert.match(harness.sendMessageCalls.at(-1).message.content, /Loop 1\/unlimited/);
   await harness.timers.flushNextTimer();
 
-  assert.equal(harness.sendUserMessageCalls.length, 1);
-  assert.match(harness.sendUserMessageCalls[0].content, /Recovery Loop: 1\/unlimited/);
-  assert.match(harness.sendUserMessageCalls[0].content, /Diagnose and fix the root cause/);
+  assert.match(harness.sendUserMessageCalls.at(-1).content, /Recovery Loop: 1\/unlimited/);
+  assert.match(harness.sendUserMessageCalls.at(-1).content, /official engine already exited auto-mode/);
 
   await stopWith(harness, context, "completed");
   assert.equal(latestDiagnostic(context, "type2_resume_auto_scheduled").attempt, 1);
   await harness.timers.flushNextTimer();
   assert.equal(harness.sendUserMessageCalls.at(-1).content, "/gsd auto");
 
+  await emitNotification(harness, context, "auto-mode paused after verification gate failure");
   await stopWith(harness, context, "blocked", "verification gate failure after resume");
   assert.equal(latestDiagnostic(context, "type2_discard_context_scheduled").attempt, 2);
   assert.match(harness.sendMessageCalls.at(-1).message.content, /Loop 2\/unlimited/);
@@ -328,7 +406,7 @@ test("sendUserMessage failures use the hidden trigger-turn fallback", async (t) 
   const context = createMockContext();
 
   await startSession(harness, context);
-  await stopWith(harness, context, "blocked", "UAT block requires a root-cause fix");
+  await stopWith(harness, context, "blocked", "UAT block uses Type 1 before any Type 2 root-cause loop");
   await harness.timers.flushNextTimer();
 
   assert.equal(harness.sendUserMessageCalls.length, 1);
@@ -337,8 +415,8 @@ test("sendUserMessage failures use the hidden trigger-turn fallback", async (t) 
   assert.equal(triggerTurnCall.message.customType, "auto-continue-recovery");
   assert.equal(triggerTurnCall.message.display, false);
   assert.deepEqual(triggerTurnCall.options, { triggerTurn: true });
-  assert.match(latestDiagnostic(context, "type2_discard_context_send_user_message_failed").detail, /synthetic sendUserMessage failure/);
-  assert.equal(latestDiagnostic(context, "type2_discard_context_trigger_turn_called").detail, "fallback_sendMessage_triggerTurn");
+  assert.match(latestDiagnostic(context, "type1_preserve_context_send_user_message_failed").detail, /synthetic sendUserMessage failure/);
+  assert.equal(latestDiagnostic(context, "type1_preserve_context_trigger_turn_called").detail, "fallback_sendMessage_triggerTurn");
 });
 
 test("diagnostic payloads expose stable two-tier fields", async (t) => {

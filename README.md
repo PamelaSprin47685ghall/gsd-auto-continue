@@ -5,9 +5,9 @@ Auto Continue is a Pi/GSD extension that turns recoverable automation failures i
 ## What It Does
 
 - Watches Pi lifecycle events for stop, notification, turn-end, and session boundary signals.
-- Detects known preserve-context failures such as network resets, stream interruptions, provider overloads, invalid JSON/tool arguments, and schema-overload guardrails.
+- Treats every non-completed, non-cancelled, non-human-intervention stop as Type 1 first unless Pi/GSD has already emitted an official auto-mode pause banner.
 - Aborts after two consecutive all-error tool-call turns so the core three-strike schema/tool interrupt does not take over first.
-- Escalates all non-preservable failures to an LLM recovery turn with the original error detail and a visible `Loop N/unlimited` counter.
+- Escalates to an LLM recovery turn only when the current stop diagnostics contain an official auto-mode pause/exit signal; manual/ordinary failures never enter Type 2.
 - Resumes `/gsd auto` automatically after a successful discard-context recovery turn.
 - Emits structured `[AutoContinue]` diagnostics through `ctx.ui.notify`, not stdout/stderr.
 
@@ -15,42 +15,20 @@ Auto Continue is a Pi/GSD extension that turns recoverable automation failures i
 
 ### Type 1 — Preserve Context
 
-Use this when the current conversation is still valuable and the failure is likely transient or locally correctable.
-
-**Signals include:**
-
-- `ECONNRESET`, `fetch failed`, socket/network failures, hard timeouts
-- `stream_exhausted_without_result`
-- `Stream idle timeout - partial response received`
-- rate limits / `429`
-- provider overload / `503`
-- LLM-generated JSON syntax errors
-- tool invocation or validation failures
-- schema overload messages such as `consecutive tool validation failures exceeded cap`
-- two consecutive all-error tool-call turns observed by the turn-end guard
+Use this for every failure while the current auto-mode context is still hot, and for every manual/ordinary failure. The extension does not classify failures by error text. If Pi/GSD has already emitted an official auto-mode pause banner in the current stop diagnostics, the hot context is considered lost and the failure goes directly to Type 2.
 
 **Behavior:**
 
 - Schedules the retry for the next turn; it does **not** perform same-turn `retryLastTurn` recovery.
 - Shows a visible system message before retrying.
 - Uses exponential backoff: `1000ms * 60 ** (attempt / 10)`, capped at 60 seconds.
-- Allows 10 attempts.
+- Gives up after 10 failed attempts outside official auto-mode exit handling; it does not escalate manual/ordinary failures to Type 2.
 - Keeps the active context hot and explicitly avoids restarting `/gsd auto`.
 
-When Type 1 reaches its retry budget, Auto Continue escalates to Type 2.
 
 ### Type 2 — Discard Context
 
-Use this when continuing in-place would preserve bad state or when Type 1 could not repair the failure.
-
-**Signals include:**
-
-- context overflow or corruption
-- failed pre/post-execution checks
-- verification gate failures
-- UAT blocks
-- git conflicts
-- any stop/error that is not handled by Type 1
+Use this only when the current stop diagnostics contain an official Pi/GSD auto-mode pause/exit signal such as `auto-mode paused`, `step-mode paused`, or `paused (escape)`. Manual/ordinary failures do not have Type 2; if Type 1 cannot repair them, Auto Continue stops and requires manual intervention.
 
 **Behavior:**
 
@@ -88,7 +66,7 @@ Optional fields include `detail` and `delayMs`. Details are truncated before dis
 
 Implementation modules:
 
-- `src/config.ts` — runtime constants, Type 1 signal phrases, manual-intervention phrases, retry limits, and backoff settings.
+- `src/config.ts` — runtime constants, manual-intervention phrases, retry limits, and backoff settings.
 - `src/runtime-state.ts` — mutable counters, guard state, notification stash, and pending timer registry helpers.
 - `src/diagnostics.ts` — structured `[AutoContinue]` lifecycle diagnostics through `ctx.ui.notify`.
 - `src/timers.ts` — retry timer scheduling, replacement, cancellation, and stale-timer protection.
@@ -97,7 +75,7 @@ Implementation modules:
 - `src/lifecycle.ts` — Pi lifecycle hook registration and event forwarding.
 - `src/types.ts` — shared runtime contracts.
 
-There is intentionally no `src/classifiers.ts`. Classification is phrase-driven inside the two-tier recovery flow; the boundary verifier rejects the old classifier module and Type 3 branches.
+There is intentionally no `src/classifiers.ts`. The recovery state machine does not guess the error type from text signals; every manual/ordinary failure gets Type 1 only, while current stop diagnostics containing an official auto-mode pause/exit signal go directly to Type 2.
 
 ## Installation
 
@@ -122,7 +100,7 @@ Verification coverage:
 
 - Behavior tests import the real public `index.ts` entrypoint and assert lifecycle behavior through mocked Pi APIs.
 - The test source-read guard keeps the suite black-box.
-- The boundary verifier ensures ownership stays modular, `index.ts` remains thin, timer primitives stay in `src/timers.ts`, dispatch fallbacks stay in `src/actions.ts`, and the removed classifier/Type 3 structure does not return.
+- The boundary verifier ensures ownership stays modular, `index.ts` remains thin, timer primitives stay in `src/timers.ts`, dispatch fallbacks stay in `src/actions.ts`, official auto-mode exit handling remains current-diagnostic-based rather than history-based, and signal classifier/Type 3 structure does not return.
 - The upstream diff check protects the read-only `gsd-2/` dependency boundary.
 
 ## Known Node Warning

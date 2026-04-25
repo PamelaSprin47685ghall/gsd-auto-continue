@@ -106,11 +106,16 @@ for (const [pattern, label] of forbiddenBehaviorTestPatterns) {
 }
 
 const configSource = readTracked("src/config.ts");
-assertMatch(configSource, /TYPE1_SIGNAL_PHRASES/, "src/config.ts must define Type 1 signal phrases without regex classifiers");
+assertMatch(configSource, /OFFICIAL_AUTO_EXIT_PHRASES/, "src/config.ts must define official auto-mode exit state phrases");
+assertNoMatch(configSource, /TYPE1_SIGNAL_PHRASES|SIGNAL_PHRASES|preserve_context_signal|schema_overload/, "src/config.ts must not reintroduce signal-based error type guessing");
 assertNoMatch(configSource, /new\s+RegExp|_RE\b/, "src/config.ts must not reintroduce regex-based error classification");
+
+const stateAndTypeSources = `${readTracked("src/runtime-state.ts")}\n${readTracked("src/types.ts")}`;
+assertNoMatch(stateAndTypeSources, /officialAutoModeExitArmed|armOfficialAutoModeExit|consumeOfficialAutoModeExit|clearOfficialAutoModeExit/, "runtime state must not remember historical auto-mode membership");
 
 const lifecycleSource = readTracked("src/lifecycle.ts");
 assertLineBudget("src/lifecycle.ts", 150);
+assertNoMatch(lifecycleSource, /officialAutoModeExitArmed|armOfficialAutoModeExit|consumeOfficialAutoModeExit|clearOfficialAutoModeExit/, "lifecycle.ts must not persist historical auto-mode state");
 assertNoMatch(lifecycleSource, /classifiers?\.ts|ClassifierDependencies/, "lifecycle.ts must not depend on legacy classifier plumbing");
 assertNoMatch(lifecycleSource, /\bctx\.abort\s*\(/, "lifecycle.ts must not directly call ctx.abort(); recovery owns tool-error abort decisions");
 assertNoMatch(
@@ -131,6 +136,9 @@ assertLineBudget("src/recovery.ts", 420);
 assertMatch(recoverySource, /\bhandleStop\s*\(/, "recovery.ts must own stop recovery decisions");
 assertMatch(recoverySource, /\bhandleToolErrorTurn\s*\(/, "recovery.ts must own tool-error guard recovery decisions");
 assertMatch(recoverySource, /Loop \$\{loop\}\/unlimited/, "recovery.ts must expose Type 2 unlimited loop status");
+assertMatch(recoverySource, /official_auto_mode_exit/, "recovery.ts must handle current official auto-mode exit diagnostics as Type 2");
+assertNoMatch(recoverySource, /officialAutoModeExitArmed|consumeOfficialAutoModeExit|armOfficialAutoModeExit|clearOfficialAutoModeExit/, "recovery.ts must not retain historical auto-mode state");
+assertNoMatch(recoverySource, /classifyFailure|TYPE1_SIGNAL_PHRASES|SIGNAL_PHRASES|preserve_context_signal|schema_overload|discard_context_required/, "recovery.ts must route failures sequentially instead of guessing an error type from signals");
 assertNoMatch(recoverySource, /classifiers?\.ts|ClassifierDependencies/, "recovery.ts must not use legacy classifier plumbing");
 assertNoMatch(recoverySource, /\btype3\b|Type 3/, "recovery.ts must not retain legacy Type 3 recovery branches");
 assertNoMatch(recoverySource, /new\s+RegExp|_RE\b/, "recovery.ts must not reintroduce regex-based error classification");

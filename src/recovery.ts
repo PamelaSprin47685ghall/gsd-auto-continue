@@ -1,5 +1,5 @@
 import type { ExtensionAPI, ExtensionContext, StopEvent } from "@gsd/pi-coding-agent";
-import { MANUAL_INTERVENTION_PHRASES, TYPE1_SIGNAL_PHRASES } from "./config.ts";
+import { MANUAL_INTERVENTION_PHRASES, OFFICIAL_AUTO_EXIT_PHRASES } from "./config.ts";
 import {
   armToolErrorGuardAbort,
   disarmToolErrorGuardAbort,
@@ -11,7 +11,7 @@ import {
 import type {
   ActionDependencies,
   Diagnostics,
-  FailureSignal,
+  RecoveryFailure,
   RuntimeConfig,
   RuntimeState,
   TimerDependencies,
@@ -64,18 +64,11 @@ export function createRecoveryOperations({ pi, state, config, diagnostics, timer
     return trimmed || fallback;
   }
 
-  function classifyFailure(combinedLog: string, stopReason: StopEvent["reason"]): FailureSignal {
-    const detail = normalizeDetail(combinedLog, String(stopReason));
-    const normalized = detail.toLowerCase();
-
-    if (containsAnyPhrase(normalized, TYPE1_SIGNAL_PHRASES)) {
-      const reason = normalized.includes("schema overload") || normalized.includes("consecutive tool validation failures")
-        ? "schema_overload"
-        : "preserve_context_signal";
-      return { tier: "type1", reason, detail };
-    }
-
-    return { tier: "type2", reason: "discard_context_required", detail };
+  function createRecoveryFailure(combinedLog: string, stopReason: StopEvent["reason"]): RecoveryFailure {
+    return {
+      reason: "failure",
+      detail: normalizeDetail(combinedLog, String(stopReason)),
+    };
   }
 
   function computeType1DelayMs(attempt: number): number {
@@ -112,7 +105,7 @@ export function createRecoveryOperations({ pi, state, config, diagnostics, timer
     }
   }
 
-  function scheduleType1(signal: FailureSignal): void {
+  function scheduleType1(signal: RecoveryFailure): void {
     timers.cancelRetryTimersExcept("type1", "type1_enter");
     state.isFixingType2 = false;
 
@@ -130,10 +123,16 @@ export function createRecoveryOperations({ pi, state, config, diagnostics, timer
       resetRetryCount(state, diagnostics, "type1", "type1_exhausted", true);
       pi.sendMessage({
         customType: "system",
-        content: "⚠️ [AutoContinue] Type 1 preserve-context retries exhausted. Escalating to Type 2 discard-context recovery...",
+        content: "❌ [AutoContinue] Type 1 preserve-context retries exhausted outside auto-mode. Auto-recovery stopped; manual intervention required.",
         display: true,
       });
-      scheduleType2({ ...signal, tier: "type2", reason: "type1_exhausted" });
+      diagnostics.logLifecycle("type1_exhausted_stand_down", {
+        retryType: "type1",
+        attempt: config.type1MaxAttempts,
+        reason: signal.reason,
+        detail: signal.detail,
+      });
+      resetToolErrorGuard(state);
       return;
     }
 
@@ -177,7 +176,7 @@ export function createRecoveryOperations({ pi, state, config, diagnostics, timer
     );
   }
 
-  function scheduleType2(signal: FailureSignal): void {
+  function scheduleType2(signal: RecoveryFailure): void {
     timers.cancelRetryTimersExcept("type2", "type2_enter");
     resetRetryCount(state, diagnostics, "type1", "type2_enter");
 
@@ -201,7 +200,7 @@ export function createRecoveryOperations({ pi, state, config, diagnostics, timer
       display: true,
     });
 
-    const prompt = `Auto-mode stopped because the current context cannot safely continue without a root-cause fix.\n\nFailure detail:\n${signal.detail}\n\nRecovery Loop: ${loop}/unlimited.\n\nYou are now in a recovery turn. Diagnose and fix the root cause using the necessary tools (for example: resolve git conflicts, repair failed checks, fix verification/UAT blockers, or adjust code/tests). Do not ask for confirmation. When this recovery turn completes, AutoContinue will resume auto-mode automatically.`;
+    const prompt = `Auto-mode stopped because the official engine already exited auto-mode before AutoContinue could preserve the hot context.\n\nFailure detail:\n${signal.detail}\n\nRecovery Loop: ${loop}/unlimited.\n\nYou are now in a recovery turn. Diagnose and fix the root cause using the necessary tools (for example: resolve git conflicts, repair failed checks, fix verification/UAT blockers, or adjust code/tests). Do not ask for confirmation. When this recovery turn completes, AutoContinue will resume auto-mode automatically.`;
 
     timers.scheduleRetryTimer(
       "type2",
@@ -290,7 +289,6 @@ export function createRecoveryOperations({ pi, state, config, diagnostics, timer
     });
 
     scheduleType1({
-      tier: "type1",
       reason: "tool_error_guard",
       detail: "Two consecutive tool-call turns returned only tool errors; retry with corrected tool arguments before the core 3x interrupt fires.",
     });
@@ -362,13 +360,21 @@ export function createRecoveryOperations({ pi, state, config, diagnostics, timer
       return;
     }
 
-    const signal = classifyFailure(combinedLog, reason);
-    if (signal.tier === "type1") {
-      scheduleType1(signal);
+    const officialAutoModeExit = containsAnyPhrase(combinedLog, OFFICIAL_AUTO_EXIT_PHRASES);
+    if (officialAutoModeExit) {
+      diagnostics.logLifecycle("official_auto_mode_exit_consumed", {
+        retryType: "type2",
+        reason,
+        detail: combinedLog || "official_auto_mode_exit",
+      });
+      scheduleType2({
+        reason: "official_auto_mode_exit",
+        detail: normalizeDetail(combinedLog, String(reason)),
+      });
       return;
     }
 
-    scheduleType2(signal);
+    scheduleType1(createRecoveryFailure(combinedLog, reason));
   }
 
   return {

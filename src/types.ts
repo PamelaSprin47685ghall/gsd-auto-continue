@@ -91,8 +91,7 @@ export interface ActionDependencies {
   ): boolean;
 }
 
-export interface FailureSignal {
-  tier: "type1" | "type2";
+export interface RecoveryFailure {
   reason: string;
   detail: string;
 }
