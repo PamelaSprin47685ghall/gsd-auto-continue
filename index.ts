@@ -49,14 +49,11 @@ const ESC_PAUSE_BANNER_RE = /\b(?:auto|step)-mode paused \(escape\)\b/i;
 const USER_INTERVENTION_RE =
   /stop directive detected|queued user message interrupted|manual intervention|paused \(escape\)/i;
 
-const TYPE3_RE =
-  /pre-execution checks (failed|error)|post-execution checks failed|verification gate failed|needs-remediation|blocking progression|unresolved code conflicts|pre-dispatch health check failed|reconciliation failed/i;
-
 const TYPE2_RE =
   /context overflow|auto-compaction failed|empty-turn recovery|rate.?limit|429|quota|unauthorized|overloaded|500|502|503/i;
 
 const TOOL_INVOCATION_PASSTHROUGH_RE =
-  /tool invocation failed|structured argument generation failed|validation failed for tool/i;
+  /^(?!.*(?:exceeded cap|consecutive)).*(?:tool invocation failed|structured argument generation failed|validation failed for tool)/i;
 
 const NETWORK_RE = /network|timeout|econnreset|socket|fetch failed|stream idle/i;
 
@@ -341,23 +338,6 @@ function standDown(reason: string, pi: ExtensionAPI, notify = false): void {
   }
 }
 
-function parseModeFromCommand(text: string): ManagedMode | undefined {
-  const trimmed = text.trim();
-  if (!trimmed.startsWith("/gsd")) return undefined;
-
-  if (/^\/gsd\s+next\b/i.test(trimmed) || /^\/gsd\s+step\b/i.test(trimmed)) {
-    return "step";
-  }
-
-  if (/^\/gsd\s+auto\b/i.test(trimmed)) {
-    // Defensive parsing: support accidental "--step" usage as step intent.
-    if (/\s--step\b/i.test(trimmed)) return "step";
-    return "auto";
-  }
-
-  return undefined;
-}
-
 function resumeCommandForMode(mode: ManagedMode): string {
   return mode === "step" ? "/gsd next" : "/gsd auto";
 }
@@ -441,10 +421,6 @@ function getStopErrorMessage(event: StopEvent): string {
   const lastMsg = event.lastMessage as AssistantMessage | undefined;
   const maybeError = (lastMsg as { errorMessage?: unknown } | undefined)?.errorMessage;
   return typeof maybeError === "string" ? maybeError : "";
-}
-
-function classifyAsType3(reason: StopEvent["reason"], combinedLog: string): boolean {
-  return reason === "blocked" || TYPE3_RE.test(combinedLog);
 }
 
 function classifyAsType2(combinedLog: string): boolean {
@@ -714,10 +690,7 @@ export default async function registerExtension(pi: ExtensionAPI) {
   });
 
   pi.on("before_agent_start", (event: BeforeAgentStartEvent) => {
-    const modeFromPrompt = parseModeFromCommand(event.prompt || "");
-    if (!modeFromPrompt) return;
-
-    transitionMode(modeFromPrompt, `before_agent_start:${modeFromPrompt}`);
+    // 引擎通知同步模式下，不再依赖主动解析 Prompt，等待引擎的 Started 通知
   });
 
   pi.on("input", (event: InputEvent) => {
@@ -725,9 +698,6 @@ export default async function registerExtension(pi: ExtensionAPI) {
 
     const text = String(event.text || "").trim();
     if (!text) return;
-
-    const modeCommand = parseModeFromCommand(text);
-    if (modeCommand) return;
 
     if (state.mode !== "inactive" && !state.isFixingType3) {
       logLifecycle("hook_input_manual_intervention", {
@@ -738,7 +708,7 @@ export default async function registerExtension(pi: ExtensionAPI) {
     }
   });
 
-  // 持续收集 GSD 内部发出的 Notification，以精准捕获 pauseAuto 的原因
+  // 持续收集 GSD 内部发出的 Notification，以精准捕获模式切换信号
   pi.on("notification", (event: NotificationEvent) => {
     const msg = String(event.message || "");
     const kind = event.kind || "error";
@@ -757,10 +727,6 @@ export default async function registerExtension(pi: ExtensionAPI) {
       transitionMode("step", "notification:step_started_or_resumed");
       return;
     }
-
-    // Stop/cancel/retry decisions must be based on the structured stop reason.
-    // Notification text like "auto-mode paused" can appear on non-manual failures,
-    // so we only use it as diagnostics and wait for the stop hook classification.
 
     const isEscPauseBanner = ESC_PAUSE_BANNER_RE.test(msg);
 
@@ -838,6 +804,7 @@ export default async function registerExtension(pi: ExtensionAPI) {
       return;
     }
 
+    // 2. 模式过滤：只在托管模式下介入
     if (state.mode === "inactive") {
       logLifecycle("stop_ignored", {
         reason,
@@ -856,26 +823,25 @@ export default async function registerExtension(pi: ExtensionAPI) {
     }
 
     // ==========================================
-    // Type 3: State Corruption / Code Blocker
+    // 决策链：网络(T1) -> 瞬时(T2) -> 兜底(T3)
     // ==========================================
-    if (state.isFixingType3 || classifyAsType3(reason, combinedLog)) {
-      handleType3(pi, reason, combinedLog, {
-        triggerReason: state.isFixingType3 ? `type3_in_progress:${reason}` : reason,
-      });
+
+    // 1. 网络/超时 (Type 1)
+    if (NETWORK_RE.test(combinedLog)) {
+      handleType1(pi, reason, combinedLog);
       return;
     }
 
-    // ==========================================
-    // Type 2: Provider / Context / LLM Syntax
-    // ==========================================
+    // 2. 供应商/配额/已知语法错误 (Type 2)
     if (classifyAsType2(combinedLog)) {
       handleType2(pi, reason, combinedLog);
       return;
     }
 
-    // ==========================================
-    // Type 1: Network Transient / Timeout
-    // ==========================================
-    handleType1(pi, reason, combinedLog);
+    // 3. 其他所有错误/阻塞/中断 (Type 3)
+    // 只要是非正常结束且不属于 T1/T2，即视为需要 AI 介入修复的状态异常
+    handleType3(pi, reason, combinedLog, {
+      triggerReason: state.isFixingType3 ? `type3_in_progress:${reason}` : reason,
+    });
   });
 }
