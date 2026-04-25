@@ -1,14 +1,69 @@
+import { createHash } from "node:crypto";
 import type { ExtensionContext } from "@gsd/pi-coding-agent";
 import { CONTINUATION_POLICY } from "./continuation-policy.ts";
 
+type TextContent = { type?: string; text?: unknown };
+
 export type ToolErrorTurnEvent = {
-  toolResults?: Array<{ isError?: boolean }>;
+  toolResults?: Array<{
+    isError?: boolean;
+    content?: TextContent[];
+  }>;
+};
+
+export type ToolCallLoopEvent = {
+  toolName?: unknown;
+  input?: unknown;
 };
 
 type WithContextContinuationOptions = {
   sendSystem(content: string): void;
   sendUserMessage(content: string): void;
   isWithoutContextRecoveryRunning(): boolean;
+};
+
+type ArmedAbort = {
+  reason: string;
+  detail: string;
+};
+
+const PREPARATION_ERROR_PATTERNS = [
+  /^Validation failed for tool\b/i,
+  /^Tool .+ not found$/i,
+  /^Tool execution was blocked$/i,
+  /^Tool loop detected:/i,
+  /Blocking to prevent infinite loop/i,
+];
+
+const STRICT_IDENTICAL_LOOP_TOOLS = new Set(["ask_user_questions"]);
+
+const resultText = (result: { content?: TextContent[] }) =>
+  (Array.isArray(result.content) ? result.content : [])
+    .filter((content) => content?.type === "text" && typeof content.text === "string")
+    .map((content) => content.text as string)
+    .join("\n")
+    .trim();
+
+const isPreparationError = (result: { isError?: boolean; content?: TextContent[] }) =>
+  result.isError === true && PREPARATION_ERROR_PATTERNS.some((pattern) => pattern.test(resultText(result)));
+
+const normalize = (value: unknown): unknown => {
+  if (Array.isArray(value)) return value.map(normalize);
+  if (!value || typeof value !== "object") return value;
+
+  return Object.keys(value)
+    .sort()
+    .reduce<Record<string, unknown>>((normalized, key) => {
+      normalized[key] = normalize((value as Record<string, unknown>)[key]);
+      return normalized;
+    }, {});
+};
+
+const toolCallSignature = (toolName: string, input: unknown) => {
+  const hash = createHash("sha256");
+  hash.update(toolName);
+  hash.update(JSON.stringify(normalize(input)));
+  return hash.digest("hex").slice(0, 16);
 };
 
 export function createWithContextContinuation({
@@ -18,8 +73,10 @@ export function createWithContextContinuation({
 }: WithContextContinuationOptions) {
   let attempts = 0;
   let timer: ReturnType<typeof setTimeout> | null = null;
-  let toolErrorTurns = 0;
-  let toolErrorAbortArmed = false;
+  let preparationErrorTurns = 0;
+  let identicalToolCallCount = 0;
+  let lastToolCallSignature = "";
+  let armedAbort: ArmedAbort | null = null;
 
   const cancelTimer = () => {
     if (!timer) return;
@@ -27,9 +84,19 @@ export function createWithContextContinuation({
     timer = null;
   };
 
-  const resetToolErrorGuard = () => {
-    toolErrorTurns = 0;
-    toolErrorAbortArmed = false;
+  const resetPreparationErrorGuard = () => {
+    preparationErrorTurns = 0;
+  };
+
+  const resetIdenticalToolCallLoop = () => {
+    identicalToolCallCount = 0;
+    lastToolCallSignature = "";
+  };
+
+  const resetRecoveryGuards = () => {
+    resetPreparationErrorGuard();
+    resetIdenticalToolCallLoop();
+    armedAbort = null;
   };
 
   const retryDelay = (attempt: number) =>
@@ -43,7 +110,7 @@ export function createWithContextContinuation({
 
     if (attempts >= CONTINUATION_POLICY.withContextMaxAttempts) {
       attempts = 0;
-      resetToolErrorGuard();
+      resetRecoveryGuards();
       sendSystem("❌ [AutoContinue] Retry limit reached. Manual intervention required.");
       return;
     }
@@ -62,23 +129,60 @@ export function createWithContextContinuation({
     }, delayMs);
   };
 
+  const abortForRetry = (ctx: ExtensionContext, systemMessage: string, abort: ArmedAbort) => {
+    if (armedAbort) return { block: true, reason: abort.detail };
+
+    armedAbort = abort;
+    sendSystem(systemMessage);
+
+    try {
+      ctx.abort();
+    } catch {
+      armedAbort = null;
+      return undefined;
+    }
+
+    return { block: true, reason: abort.detail };
+  };
+
   return {
     get active() {
-      return timer !== null || attempts > 0 || toolErrorTurns > 0 || toolErrorAbortArmed;
+      return timer !== null || attempts > 0 || armedAbort !== null;
     },
 
     standDown() {
       const wasActive = this.active;
       attempts = 0;
-      resetToolErrorGuard();
+      resetRecoveryGuards();
       cancelTimer();
       return wasActive;
     },
 
     scheduleRetry,
 
-    resetToolErrorGuardUnlessCancelled(reason: string) {
-      if (reason !== "cancelled" && toolErrorAbortArmed) resetToolErrorGuard();
+    resetIdenticalToolCallLoop,
+
+    handleToolCallLoop(event: ToolCallLoopEvent, ctx: ExtensionContext) {
+      if (isWithoutContextRecoveryRunning()) return undefined;
+      if (typeof event.toolName !== "string" || STRICT_IDENTICAL_LOOP_TOOLS.has(event.toolName)) {
+        resetIdenticalToolCallLoop();
+        return undefined;
+      }
+
+      const signature = toolCallSignature(event.toolName, event.input ?? {});
+      identicalToolCallCount = signature === lastToolCallSignature ? identicalToolCallCount + 1 : 1;
+      lastToolCallSignature = signature;
+
+      if (identicalToolCallCount < CONTINUATION_POLICY.maxIdenticalToolCallsBeforeAbort) return undefined;
+
+      return abortForRetry(
+        ctx,
+        `⚠️ [AutoContinue] ${event.toolName} is repeating identical arguments. Aborting before GSD's loop guard blocks the next call.`,
+        {
+          reason: "identical_tool_call_guard",
+          detail: `${event.toolName} was called ${identicalToolCallCount} consecutive times with identical arguments; retry with a different approach before GSD's fifth-call loop guard fires.`,
+        },
+      );
     },
 
     handleToolErrors(event: ToolErrorTurnEvent, ctx: ExtensionContext) {
@@ -87,32 +191,28 @@ export function createWithContextContinuation({
       const results = Array.isArray(event.toolResults) ? event.toolResults : [];
       if (results.length === 0 || results.some((result) => result == null || typeof result.isError !== "boolean")) return;
 
-      if (!results.every((result) => result.isError)) {
-        resetToolErrorGuard();
-        return;
+      const preparationErrors = results.filter(isPreparationError).length;
+      if (preparationErrors === results.length) {
+        preparationErrorTurns += 1;
+      } else if (preparationErrors === 0) {
+        resetPreparationErrorGuard();
       }
 
-      toolErrorTurns += 1;
-      if (toolErrorTurns < CONTINUATION_POLICY.maxToolErrorsBeforeAbort || toolErrorAbortArmed) return;
+      if (preparationErrorTurns < CONTINUATION_POLICY.maxPreparationErrorTurnsBeforeAbort) return;
 
-      toolErrorAbortArmed = true;
-      sendSystem("⚠️ [AutoContinue] Tool calls are failing repeatedly. Aborting this turn and retrying with context.");
-
-      try {
-        ctx.abort();
-      } catch {
-        toolErrorAbortArmed = false;
-      }
+      abortForRetry(ctx, "⚠️ [AutoContinue] Tool-call schema failures are repeating. Aborting this turn and retrying with context.", {
+        reason: "tool_schema_guard",
+        detail:
+          "Two consecutive turns had all tool calls fail before execution; retry with corrected tool arguments before Pi's three-turn schema-overload interrupt fires.",
+      });
     },
 
-    handleCancelledToolGuard() {
-      if (!toolErrorAbortArmed) return false;
+    handleProgrammaticAbort() {
+      if (!armedAbort) return false;
 
-      resetToolErrorGuard();
-      scheduleRetry(
-        "tool_error_guard",
-        "Two consecutive tool-call turns returned only tool errors; retry with corrected tool arguments before the core interrupt fires.",
-      );
+      const abort = armedAbort;
+      resetRecoveryGuards();
+      scheduleRetry(abort.reason, abort.detail);
       return true;
     },
   };

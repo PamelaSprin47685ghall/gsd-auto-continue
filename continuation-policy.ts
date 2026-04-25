@@ -3,7 +3,8 @@ export const CONTINUATION_POLICY = {
   withContextMaxAttempts: 10,
   withContextBackoffBaseMs: 1000,
   maxWithContextDelayMs: 60_000,
-  maxToolErrorsBeforeAbort: 2,
+  maxPreparationErrorTurnsBeforeAbort: 2,
+  maxIdenticalToolCallsBeforeAbort: 4,
   resumeCommand: "/gsd auto",
 };
 

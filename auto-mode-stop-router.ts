@@ -1,6 +1,6 @@
 import type { ExtensionAPI, InputEvent, NotificationEvent, SessionEndEvent, StopEvent } from "@gsd/pi-coding-agent";
 import { CONTINUATION_POLICY, WITHOUT_CONTEXT_STOP_PHRASES, matchesManualIntervention } from "./continuation-policy.ts";
-import { createWithContextContinuation, type ToolErrorTurnEvent } from "./with-context-continuation.ts";
+import { createWithContextContinuation, type ToolCallLoopEvent, type ToolErrorTurnEvent } from "./with-context-continuation.ts";
 import { createWithoutContextRecovery } from "./without-context-recovery.ts";
 
 const includesAny = (text: string, phrases: readonly string[]) =>
@@ -65,6 +65,16 @@ export function registerAutoModeStopRouter(pi: ExtensionAPI) {
 
   pi.on("session_shutdown", () => standDown(false));
 
+  pi.on("session_start", () => {
+    withContext.resetIdenticalToolCallLoop();
+  });
+
+  pi.on("agent_end", () => {
+    withContext.resetIdenticalToolCallLoop();
+  });
+
+  pi.on("tool_call", (event: ToolCallLoopEvent, ctx) => withContext.handleToolCallLoop(event, ctx));
+
   pi.on("turn_end", (event: ToolErrorTurnEvent, ctx) => {
     withContext.handleToolErrors(event, ctx);
   });
@@ -86,8 +96,6 @@ export function registerAutoModeStopRouter(pi: ExtensionAPI) {
   pi.on("stop", (event: StopEvent) => {
     const detail = drainDetail(stopError(event));
 
-    withContext.resetToolErrorGuardUnlessCancelled(event.reason);
-
     if (withoutContext.recovering && event.reason === "completed") {
       withoutContext.resumeAutoMode();
       return;
@@ -98,8 +106,15 @@ export function registerAutoModeStopRouter(pi: ExtensionAPI) {
       return;
     }
 
+    if (withContext.handleProgrammaticAbort()) return;
+
     if (event.reason === "cancelled") {
-      if (!withContext.handleCancelledToolGuard()) standDown(true);
+      standDown(true);
+      return;
+    }
+
+    if (/\boperation aborted\b/i.test(detail)) {
+      standDown(true);
       return;
     }
 
