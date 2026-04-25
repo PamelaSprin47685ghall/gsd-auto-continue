@@ -1,8 +1,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@gsd/pi-coding-agent";
 
-export type RetryType = "none" | "type1" | "type2" | "type3";
+export type RetryType = "none" | "type1" | "type2";
 export type ManagedRetryType = Exclude<RetryType, "none">;
-export type EscalationType = "none" | "type1_to_type2" | "type2_to_type3";
 export type UiNotifyLevel = "info" | "warning" | "error" | "success";
 
 export interface ScheduledRetryTimer {
@@ -11,21 +10,17 @@ export interface ScheduledRetryTimer {
   attempt: number;
   reason: string;
   delayMs: number;
-  escalation: EscalationType;
   detail?: string;
 }
 
 export interface RuntimeState {
   lastNotifications: string[];
   type1Retries: number;
-  type2Retries: number;
-  type3Retries: number;
-  schemaOverloadRetries: number;
-  isFixingType3: boolean;
+  type2Loops: number;
+  isFixingType2: boolean;
   retryTimers: Map<ManagedRetryType, ScheduledRetryTimer>;
   consecutiveToolErrorTurns: number;
   toolErrorGuardAbortArmed: boolean;
-  autoPauseSignalArmedForStop: boolean;
 }
 
 export interface ToolErrorTurnEvent {
@@ -36,10 +31,11 @@ export interface ToolErrorTurnEvent {
 export interface RuntimeConfig {
   plugin: string;
   maxNotifications: number;
-  retryLimits: Record<ManagedRetryType, number>;
-  schemaOverloadRetryDelayMs: number;
-  schemaOverloadMaxRetries: number;
+  type1MaxAttempts: number;
+  maxType1DelayMs: number;
+  type1BackoffBaseMs: number;
   maxToolErrorsBeforeAbort: number;
+  resumeCommand: string;
 }
 
 export interface LifecycleLogOptions {
@@ -48,7 +44,6 @@ export interface LifecycleLogOptions {
   reason?: string;
   detail?: string;
   delayMs?: number;
-  escalation?: EscalationType;
 }
 
 export interface Diagnostics {
@@ -69,7 +64,6 @@ export interface TimerDependencies {
       attempt: number;
       reason: string;
       detail?: string;
-      escalation?: EscalationType;
     },
     action: () => void,
   ): void;
@@ -84,7 +78,6 @@ export interface ActionDependencies {
       retryType: ManagedRetryType;
       attempt: number;
       reason: string;
-      escalation?: EscalationType;
     },
   ): boolean;
   safeRetryLastTurn(
@@ -98,13 +91,8 @@ export interface ActionDependencies {
   ): boolean;
 }
 
-export interface ClassifierDependencies {
-  classifyAsSchemaOverload(combinedLog: string): boolean;
-  classifyAsType2Provider(combinedLog: string): boolean;
-  classifyAsToolInvocationPassthrough(combinedLog: string): boolean;
-  classifyAsNetwork(combinedLog: string): boolean;
-  classifyAsUserIntervention(combinedLog: string): boolean;
-  hasAutoPauseContext(combinedLog: string): boolean;
-  isEscapePauseBanner(message: string): boolean;
-  getResumeCommand(): string;
+export interface FailureSignal {
+  tier: "type1" | "type2";
+  reason: string;
+  detail: string;
 }

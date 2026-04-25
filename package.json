@@ -1,7 +1,7 @@
 {
   "name": "gsd-auto-continue",
   "version": "1.0.0",
-  "description": "GSD Auto Continue Extension - Precision 3 Tier Recovery (Verbose)",
+  "description": "GSD Auto Continue Extension - two-tier recovery for hot-context retries and root-cause fix loops",
   "gsd": {
     "extension": true
   },

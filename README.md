@@ -1,101 +1,129 @@
 # GSD Auto Continue
 
-A robust error-recovery extension for GSD that keeps `auto-mode` moving. It classifies failures into three recovery tiers and adds a dedicated schema-overload continuation path so core guardrails do not permanently kill automation.
+Auto Continue is a Pi/GSD extension that turns recoverable automation failures into explicit recovery turns instead of letting `auto-mode` stall. The extension follows the source specification preserved in [`SPEC-ORIGIN.md`](./SPEC-ORIGIN.md): first preserve the hot context whenever possible, then fall back to root-cause repair loops when the context can no longer be trusted.
 
-## Recovery Tiers
+## What It Does
 
-### Type 1: Network Transient / Timeout
+- Watches Pi lifecycle events for stop, notification, turn-end, and session boundary signals.
+- Detects known preserve-context failures such as network resets, stream interruptions, provider overloads, invalid JSON/tool arguments, and schema-overload guardrails.
+- Aborts after two consecutive all-error tool-call turns so the core three-strike schema/tool interrupt does not take over first.
+- Escalates all non-preservable failures to an LLM recovery turn with the original error detail and a visible `Loop N/unlimited` counter.
+- Resumes `/gsd auto` automatically after a successful discard-context recovery turn.
+- Emits structured `[AutoContinue]` diagnostics through `ctx.ui.notify`, not stdout/stderr.
 
-- **Symptoms**: `ECONNRESET`, `fetch failed`, idle watchdogs, or hard timeouts.
-- **Strategy**: Exponential backoff from 2s to 30s with in-place retry.
-- **Limit**: 10 attempts.
-- **Scope**: Active in both `auto` and `manual` modes.
+## Recovery Model
 
-### Type 2: Provider / Syntax / Context
+### Type 1 — Preserve Context
 
-- **Symptoms**: Rate limits (429), API overloads (503), context overflows, or LLM-generated JSON syntax errors.
-- **Strategy**: 5-second cooldown followed by `/gsd auto` to refresh the execution context.
-- **Limit**: 5 attempts.
+Use this when the current conversation is still valuable and the failure is likely transient or locally correctable.
 
-### Type 3: State Corruption / Logic Blocker
+**Signals include:**
 
-- **Symptoms**: Failed pre/post-execution checks, verification gate failures, UAT blocks, or git conflicts.
-- **Strategy**: Escalate to the LLM with a diagnostic prompt. The agent is instructed to fix the root cause, and auto-mode resumes automatically once the fix turn completes.
-- **Limit**: 3 attempts.
+- `ECONNRESET`, `fetch failed`, socket/network failures, hard timeouts
+- `stream_exhausted_without_result`
+- `Stream idle timeout - partial response received`
+- rate limits / `429`
+- provider overload / `503`
+- LLM-generated JSON syntax errors
+- tool invocation or validation failures
+- schema overload messages such as `consecutive tool validation failures exceeded cap`
+- two consecutive all-error tool-call turns observed by the turn-end guard
 
-### Schema-Overload Continuation
+**Behavior:**
 
-- **Symptoms**: `Schema overload: consecutive tool validation failures exceeded cap` or `consecutive turns with all tool calls failing`.
-- **Strategy**: No `/gsd auto` restart. The extension schedules in-place `retryLastTurn` so context stays hot and the auto loop does not die on the first 3x cap event.
-- **Limit**: Unlimited by default. Set `GSD_AUTO_CONTINUE_SCHEMA_OVERLOAD_MAX_RETRIES` to a positive integer to enable a cap.
+- Schedules the retry for the next turn; it does **not** perform same-turn `retryLastTurn` recovery.
+- Shows a visible system message before retrying.
+- Uses exponential backoff: `1000ms * 60 ** (attempt / 10)`, capped at 60 seconds.
+- Allows 10 attempts.
+- Keeps the active context hot and explicitly avoids restarting `/gsd auto`.
 
-## Installation
+When Type 1 reaches its retry budget, Auto Continue escalates to Type 2.
 
-Run the installer from the repository root:
+### Type 2 — Discard Context
 
-```bash
-gsd install .
-```
+Use this when continuing in-place would preserve bad state or when Type 1 could not repair the failure.
 
-The package declares `index.ts` as the Pi extension entrypoint.
+**Signals include:**
+
+- context overflow or corruption
+- failed pre/post-execution checks
+- verification gate failures
+- UAT blocks
+- git conflicts
+- any stop/error that is not handled by Type 1
+
+**Behavior:**
+
+- Dispatches an LLM recovery prompt with the captured failure detail.
+- Marks the prompt with `Recovery Loop: N/unlimited`.
+- Instructs the agent to diagnose and fix the root cause without asking for confirmation.
+- Waits for that recovery turn to complete.
+- Resumes auto-mode by sending `/gsd auto`.
+- Has no attempt cap; it keeps looping until the problem is fixed or a human interrupts.
+
+## Manual Intervention
+
+Auto Continue stands down when it sees explicit human/operator intervention while recovery is active. It cancels pending timers, clears retry state, and sends a visible system notification that recovery has stopped.
+
+Plain completed stops also clear recovery state. Programmatic session boundaries preserve active recovery timers so a scheduled recovery can continue across the session boundary.
 
 ## Runtime Diagnostics
 
-This implementation is intentionally noisy so future agents can diagnose recovery behavior without reading ignored runtime artifacts.
+Diagnostics are intentionally structured and noisy enough for future agents to inspect behavior from the UI stream.
 
-- **Internal logs**: Terminal output uses `[AutoContinue]` JSON lifecycle diagnostics.
-- **System messages**: Recovery status is displayed in chat-facing system notifications.
-- **Intervention detection**: The extension stands down only on explicit manual-intervention signals such as stop directives, queued user interruption, or cancelled stops.
+Every diagnostic payload includes:
 
-## Modular Architecture
+- `plugin`
+- `phase`
+- `retryType`
+- `attempt`
+- `reason`
+- `fixingType2`
 
-`index.ts` is a thin public hub. It creates the runtime dependencies, wires them together, and delegates lifecycle registration; it should not own retry decisions, timer primitives, dispatch fallbacks, or hook bodies.
+Optional fields include `detail` and `delayMs`. Details are truncated before display to keep notifications readable.
 
-The implementation owners live under `gsd-auto-continue/src/`:
+## Architecture
 
-- `src/config.ts` builds runtime configuration, including schema-overload retry limits.
-- `src/runtime-state.ts` owns mutable counters, armed guard state, and pending timer handles.
-- `src/diagnostics.ts` emits the `[AutoContinue]` lifecycle diagnostics and user-visible recovery status.
-- `src/timers.ts` owns retry timer scheduling and cancellation primitives.
-- `src/actions.ts` owns safe Pi dispatch helpers, including user messages, hidden trigger-turn fallback, and `retryLastTurn`.
-- `src/classifiers.ts` classifies stop reasons, provider failures, transient failures, manual intervention, and schema-overload signatures.
-- `src/recovery.ts` owns the recovery state machine for Type 1, Type 2, Type 3, and schema-overload continuation paths.
-- `src/lifecycle.ts` registers Pi lifecycle hooks and forwards events to recovery operations.
-- `src/types.ts` defines shared types used across the package modules.
+`index.ts` is a composition-only entrypoint. It builds dependencies and delegates lifecycle registration; it does not own recovery decisions, timers, dispatch fallbacks, or hook bodies.
 
-The boundary verifier enforces this layout so future refactors can move code within owner modules without turning `index.ts` back into a god file.
+Implementation modules:
 
-## Verification from the Repository Root
+- `src/config.ts` — runtime constants, Type 1 signal phrases, manual-intervention phrases, retry limits, and backoff settings.
+- `src/runtime-state.ts` — mutable counters, guard state, notification stash, and pending timer registry helpers.
+- `src/diagnostics.ts` — structured `[AutoContinue]` lifecycle diagnostics through `ctx.ui.notify`.
+- `src/timers.ts` — retry timer scheduling, replacement, cancellation, and stale-timer protection.
+- `src/actions.ts` — safe Pi dispatch helpers for user messages, hidden trigger-turn fallback, and optional `retryLastTurn` dispatch support.
+- `src/recovery.ts` — Type 1 / Type 2 state machine, stop handling, tool-error guard, Type 2 auto-resume, and error-message extraction.
+- `src/lifecycle.ts` — Pi lifecycle hook registration and event forwarding.
+- `src/types.ts` — shared runtime contracts.
 
-Run these commands from the repository root before claiming the extension is ready:
+There is intentionally no `src/classifiers.ts`. Classification is phrase-driven inside the two-tier recovery flow; the boundary verifier rejects the old classifier module and Type 3 branches.
+
+## Installation
 
 ```bash
-# 1) Public-entrypoint behavior suite plus structural boundary verifier.
+gsd install <git repo>
+```
+
+The package declares `index.ts` as the Pi extension entrypoint in `package.json`.
+
+## Verification
+
+Run from the repository root:
+
+```bash
 npm --prefix gsd-auto-continue run verify
-
-# 2) Optional explicit source-read guard for the behavior suite.
 ! rg "readFileSync|readFile\(|source\.includes|assert\.match\(source" gsd-auto-continue/index.test.mjs
-
-# 3) Standalone boundary verification when investigating ownership drift.
 node gsd-auto-continue/scripts/verify-boundaries.mjs
-
-# 4) Upstream immutability contract.
 git diff -- gsd-2 --exit-code
 ```
 
-What each surface proves:
+Verification coverage:
 
-- `npm --prefix gsd-auto-continue run verify` runs the package-local behavior tests and boundary verifier through the public npm script. The behavior suite imports the real `index.ts` entrypoint, captures lifecycle hooks through mocked Pi APIs, and asserts externally visible dispatches and `[AutoContinue]` diagnostics.
-- The source-read guard keeps `gsd-auto-continue/index.test.mjs` black-box: tests must not inspect implementation source text with `readFileSync`, `readFile(`, `source.includes`, or `assert.match(source)`.
-- `node gsd-auto-continue/scripts/verify-boundaries.mjs` checks structural module ownership, including `src/recovery.ts` owning recovery decisions, `src/timers.ts` owning timer primitives, `src/actions.ts` owning dispatch fallbacks, and `index.ts` remaining a thin hub.
-- `git diff -- gsd-2 --exit-code` preserves the read-only upstream `gsd-2/` contract. A non-empty diff means this package change accidentally modified upstream sources and must be investigated before close-out.
-
-Failure interpretation:
-
-- Behavior test failures point to a public-entrypoint regression in lifecycle registration, recovery scheduling, dispatch fallback behavior, or emitted diagnostics.
-- Source-read guard failures mean the behavior suite is becoming implementation-coupled and should be rewritten back to public-boundary assertions.
-- Boundary verifier failures point to module ownership drift or stale package metadata.
-- Upstream diff failures point to an accidental change outside this package's ownership boundary.
+- Behavior tests import the real public `index.ts` entrypoint and assert lifecycle behavior through mocked Pi APIs.
+- The test source-read guard keeps the suite black-box.
+- The boundary verifier ensures ownership stays modular, `index.ts` remains thin, timer primitives stay in `src/timers.ts`, dispatch fallbacks stay in `src/actions.ts`, and the removed classifier/Type 3 structure does not return.
+- The upstream diff check protects the read-only `gsd-2/` dependency boundary.
 
 ## Known Node Warning
 

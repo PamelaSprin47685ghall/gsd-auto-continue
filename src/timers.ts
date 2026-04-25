@@ -1,4 +1,4 @@
-import type { Diagnostics, EscalationType, ManagedRetryType, RuntimeState, TimerDependencies } from "./types.ts";
+import type { Diagnostics, ManagedRetryType, RuntimeState, TimerDependencies } from "./types.ts";
 
 export function createTimerDependencies(state: RuntimeState, diagnostics: Diagnostics): TimerDependencies {
   function cancelRetryTimer(retryType: ManagedRetryType, reason: string): void {
@@ -14,7 +14,6 @@ export function createTimerDependencies(state: RuntimeState, diagnostics: Diagno
       reason,
       detail: timer.phase,
       delayMs: timer.delayMs,
-      escalation: timer.escalation,
     });
   }
 
@@ -42,13 +41,11 @@ export function createTimerDependencies(state: RuntimeState, diagnostics: Diagno
         attempt,
         reason,
         detail,
-        escalation = "none",
       }: {
         phase: string;
         attempt: number;
         reason: string;
         detail?: string;
-        escalation?: EscalationType;
       },
       action: () => void,
     ): void {
@@ -60,7 +57,6 @@ export function createTimerDependencies(state: RuntimeState, diagnostics: Diagno
         reason,
         detail,
         delayMs,
-        escalation,
       });
 
       const timerHandle = setTimeout(() => {
@@ -71,7 +67,6 @@ export function createTimerDependencies(state: RuntimeState, diagnostics: Diagno
             attempt,
             reason: `${reason}:stale_timer`,
             delayMs,
-            escalation,
           });
           return;
         }
@@ -83,7 +78,6 @@ export function createTimerDependencies(state: RuntimeState, diagnostics: Diagno
           reason,
           detail,
           delayMs,
-          escalation,
         });
 
         try {
@@ -94,7 +88,6 @@ export function createTimerDependencies(state: RuntimeState, diagnostics: Diagno
             attempt,
             reason,
             delayMs,
-            escalation,
             detail: diagnostics.normalizeError(error),
           });
         }
@@ -106,7 +99,6 @@ export function createTimerDependencies(state: RuntimeState, diagnostics: Diagno
         attempt,
         reason,
         delayMs,
-        escalation,
         detail,
       });
     },

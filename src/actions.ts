@@ -1,5 +1,5 @@
 import type { ExtensionAPI } from "@gsd/pi-coding-agent";
-import type { ActionDependencies, Diagnostics, EscalationType, ManagedRetryType } from "./types.ts";
+import type { ActionDependencies, Diagnostics, ManagedRetryType } from "./types.ts";
 
 export function createActionDependencies(diagnostics: Diagnostics): ActionDependencies {
   return {
@@ -11,13 +11,11 @@ export function createActionDependencies(diagnostics: Diagnostics): ActionDepend
         retryType,
         attempt,
         reason,
-        escalation = "none",
       }: {
         phase: string;
         retryType: ManagedRetryType;
         attempt: number;
         reason: string;
-        escalation?: EscalationType;
       },
     ): boolean {
       try {
@@ -28,7 +26,6 @@ export function createActionDependencies(diagnostics: Diagnostics): ActionDepend
           retryType,
           attempt,
           reason,
-          escalation,
           detail: diagnostics.normalizeError(error),
         });
       }
@@ -39,7 +36,6 @@ export function createActionDependencies(diagnostics: Diagnostics): ActionDepend
           retryType,
           attempt,
           reason,
-          escalation,
           detail: "sendMessage_missing",
         });
         return false;
@@ -55,7 +51,6 @@ export function createActionDependencies(diagnostics: Diagnostics): ActionDepend
           retryType,
           attempt,
           reason,
-          escalation,
           detail: "fallback_sendMessage_triggerTurn",
         });
         return true;
@@ -64,7 +59,6 @@ export function createActionDependencies(diagnostics: Diagnostics): ActionDepend
           retryType,
           attempt,
           reason,
-          escalation,
           detail: diagnostics.normalizeError(error),
         });
         return false;

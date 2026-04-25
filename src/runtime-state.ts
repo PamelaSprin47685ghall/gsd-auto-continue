@@ -1,43 +1,28 @@
-import type { Diagnostics, ManagedRetryType, RuntimeConfig, RuntimeState } from "./types.ts";
+import type { Diagnostics, ManagedRetryType, RuntimeState } from "./types.ts";
 
 export function createRuntimeState(): RuntimeState {
   return {
     lastNotifications: [],
     type1Retries: 0,
-    type2Retries: 0,
-    type3Retries: 0,
-    schemaOverloadRetries: 0,
-    isFixingType3: false,
+    type2Loops: 0,
+    isFixingType2: false,
     retryTimers: new Map(),
     consecutiveToolErrorTurns: 0,
     toolErrorGuardAbortArmed: false,
-    autoPauseSignalArmedForStop: false,
   };
 }
 
 export function getRetryCount(state: RuntimeState, retryType: ManagedRetryType): number {
-  switch (retryType) {
-    case "type1":
-      return state.type1Retries;
-    case "type2":
-      return state.type2Retries;
-    case "type3":
-      return state.type3Retries;
-  }
+  return retryType === "type1" ? state.type1Retries : state.type2Loops;
 }
 
 export function setRetryCount(state: RuntimeState, retryType: ManagedRetryType, value: number): void {
-  switch (retryType) {
-    case "type1":
-      state.type1Retries = value;
-      break;
-    case "type2":
-      state.type2Retries = value;
-      break;
-    case "type3":
-      state.type3Retries = value;
-      break;
+  if (retryType === "type1") {
+    state.type1Retries = value;
+    return;
   }
+
+  state.type2Loops = value;
 }
 
 export function resetRetryCount(
@@ -57,22 +42,6 @@ export function resetRetryCount(
   });
 }
 
-export function resetSchemaOverloadRetries(
-  state: RuntimeState,
-  diagnostics: Diagnostics,
-  reason: string,
-  forceLog = false,
-): void {
-  if (state.schemaOverloadRetries === 0 && !forceLog) return;
-
-  state.schemaOverloadRetries = 0;
-  diagnostics.logLifecycle("schema_overload_reset", {
-    retryType: "type1",
-    attempt: 0,
-    reason,
-  });
-}
-
 export function resetRetries(
   state: RuntimeState,
   diagnostics: Diagnostics,
@@ -81,8 +50,6 @@ export function resetRetries(
 ): void {
   resetRetryCount(state, diagnostics, "type1", reason, forceLog);
   resetRetryCount(state, diagnostics, "type2", reason, forceLog);
-  resetRetryCount(state, diagnostics, "type3", reason, forceLog);
-  resetSchemaOverloadRetries(state, diagnostics, reason, forceLog);
 }
 
 export function recordToolErrorTurn(state: RuntimeState): number {
@@ -106,33 +73,15 @@ export function disarmToolErrorGuardAbort(state: RuntimeState): void {
   state.toolErrorGuardAbortArmed = false;
 }
 
-export function rememberNotification(state: RuntimeState, config: RuntimeConfig, message: string): void {
+export function rememberNotification(state: RuntimeState, message: string, maxNotifications: number): void {
   state.lastNotifications.push(message);
-  if (state.lastNotifications.length > config.maxNotifications) {
+  if (state.lastNotifications.length > maxNotifications) {
     state.lastNotifications.shift();
   }
 }
 
 export function consumeStopDiagnostics(state: RuntimeState, errorMessage: string): string {
-  const combined = `${state.lastNotifications.join(" | ")} ${errorMessage}`.trim().toLowerCase();
+  const combined = `${state.lastNotifications.join(" | ")} ${errorMessage}`.trim();
   state.lastNotifications = [];
   return combined;
-}
-
-export function consumeAutoPauseSignalForStop(
-  state: RuntimeState,
-  hasAutoPauseContext: (combinedLog: string) => boolean,
-  combinedLog: string,
-): boolean {
-  if (hasAutoPauseContext(combinedLog)) {
-    state.autoPauseSignalArmedForStop = false;
-    return true;
-  }
-
-  if (state.autoPauseSignalArmedForStop) {
-    state.autoPauseSignalArmedForStop = false;
-    return true;
-  }
-
-  return false;
 }

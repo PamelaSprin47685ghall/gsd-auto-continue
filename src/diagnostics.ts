@@ -3,7 +3,7 @@ import type { Diagnostics, LifecycleLogOptions, RuntimeConfig, RuntimeState, UiN
 export function createDiagnostics(config: RuntimeConfig, state: RuntimeState): Diagnostics {
   let uiNotify: ((message: string, level?: UiNotifyLevel) => void) | null = null;
 
-  function truncate(text: string, max = 240): string {
+  function truncate(text: string, max = 320): string {
     if (text.length <= max) return text;
     return `${text.slice(0, max - 3)}...`;
   }
@@ -30,14 +30,7 @@ export function createDiagnostics(config: RuntimeConfig, state: RuntimeState): D
 
     logLifecycle(
       phase: string,
-      {
-        retryType = "none",
-        attempt = 0,
-        reason = "n/a",
-        detail,
-        delayMs,
-        escalation = "none",
-      }: LifecycleLogOptions = {},
+      { retryType = "none", attempt = 0, reason = "n/a", detail, delayMs }: LifecycleLogOptions = {},
     ): void {
       const payload: Record<string, unknown> = {
         plugin: config.plugin,
@@ -45,12 +38,11 @@ export function createDiagnostics(config: RuntimeConfig, state: RuntimeState): D
         retryType,
         attempt,
         reason,
-        fixingType3: state.isFixingType3,
+        fixingType2: state.isFixingType2,
       };
 
-      if (detail) payload.detail = truncate(detail, 320);
+      if (detail) payload.detail = truncate(detail);
       if (typeof delayMs === "number") payload.delayMs = delayMs;
-      if (escalation !== "none") payload.escalation = escalation;
 
       notifyLifecycleUi(payload);
     },

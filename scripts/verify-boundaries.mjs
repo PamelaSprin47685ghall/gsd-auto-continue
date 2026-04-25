@@ -27,6 +27,12 @@ function assertFileExists(relativePath) {
   }
 }
 
+function assertFileAbsent(relativePath) {
+  if (existsSync(join(root, relativePath))) {
+    fail(`Forbidden legacy file still exists: ${relativePath}`);
+  }
+}
+
 function assertMatch(source, pattern, message) {
   if (!pattern.test(source)) fail(message);
 }
@@ -55,7 +61,6 @@ const requiredFiles = [
   "index.ts",
   "index.test.mjs",
   "src/actions.ts",
-  "src/classifiers.ts",
   "src/config.ts",
   "src/diagnostics.ts",
   "src/lifecycle.ts",
@@ -69,6 +74,8 @@ for (const relativePath of requiredFiles) {
   assertFileExists(relativePath);
 }
 
+assertFileAbsent("src/classifiers.ts");
+
 const packageJson = JSON.parse(readTracked("package.json"));
 if (JSON.stringify(packageJson.pi?.extensions) !== JSON.stringify(["index.ts"])) {
   fail('package.json must declare pi.extensions exactly as ["index.ts"]');
@@ -80,11 +87,12 @@ assertMatch(indexSource, /export\s+default\s+async\s+function\s+registerExtensio
 assertMatch(indexSource, /from\s+["']\.\/src\/lifecycle\.ts["']/, "index.ts must delegate lifecycle registration to src/lifecycle.ts");
 assertMatch(indexSource, /registerLifecycleHooks\s*\(/, "index.ts must call registerLifecycleHooks rather than own lifecycle handlers");
 assertMatch(indexSource, /createRecoveryOperations\s*\(/, "index.ts must compose recovery operations rather than inline recovery logic");
+assertNoMatch(indexSource, /classifiers?\.ts|createClassifier|ClassifierDependencies/, "index.ts must not import legacy classifier plumbing");
 assertNoMatch(indexSource, /\bpi\.on\s*\(/, "index.ts must remain a thin hub and not register lifecycle hooks directly");
 assertNoMatch(indexSource, /\bctx\.abort\s*\(/, "index.ts must not own abort behavior");
 assertNoMatch(indexSource, /\b(?:setTimeout|clearTimeout)\s*\(/, "index.ts must not own timer scheduling primitives");
 assertNoMatch(indexSource, /\b(?:sendUserMessage|retryLastTurn)\s*\(/, "index.ts must not own Pi dispatch fallback primitives");
-assertNoMatch(indexSource, /\bhandle(?:Stop|Type0|Type1|Type2|Type3|ToolErrorTurn)\b/, "index.ts must not grow recovery decision handlers");
+assertNoMatch(indexSource, /\bhandle(?:Stop|Type1|Type2|ToolErrorTurn)\b/, "index.ts must not grow recovery decision handlers");
 
 const testSource = readTracked("index.test.mjs");
 const forbiddenBehaviorTestPatterns = [
@@ -97,8 +105,13 @@ for (const [pattern, label] of forbiddenBehaviorTestPatterns) {
   assertNoMatch(testSource, pattern, `index.test.mjs must stay behavioral and not reintroduce implementation source reads (${label})`);
 }
 
+const configSource = readTracked("src/config.ts");
+assertMatch(configSource, /TYPE1_SIGNAL_PHRASES/, "src/config.ts must define Type 1 signal phrases without regex classifiers");
+assertNoMatch(configSource, /new\s+RegExp|_RE\b/, "src/config.ts must not reintroduce regex-based error classification");
+
 const lifecycleSource = readTracked("src/lifecycle.ts");
-assertLineBudget("src/lifecycle.ts", 180);
+assertLineBudget("src/lifecycle.ts", 150);
+assertNoMatch(lifecycleSource, /classifiers?\.ts|ClassifierDependencies/, "lifecycle.ts must not depend on legacy classifier plumbing");
 assertNoMatch(lifecycleSource, /\bctx\.abort\s*\(/, "lifecycle.ts must not directly call ctx.abort(); recovery owns tool-error abort decisions");
 assertNoMatch(
   lifecycleSource,
@@ -114,9 +127,13 @@ assertNoMatch(lifecycleSource, /\b(?:setTimeout|clearTimeout)\s*\(/, "lifecycle.
 assertNoMatch(lifecycleSource, /\bsendUserMessage\s*\(/, "lifecycle.ts must not own Pi user-message dispatch fallbacks");
 
 const recoverySource = readTracked("src/recovery.ts");
-assertLineBudget("src/recovery.ts", 720);
+assertLineBudget("src/recovery.ts", 420);
 assertMatch(recoverySource, /\bhandleStop\s*\(/, "recovery.ts must own stop recovery decisions");
 assertMatch(recoverySource, /\bhandleToolErrorTurn\s*\(/, "recovery.ts must own tool-error guard recovery decisions");
+assertMatch(recoverySource, /Loop \$\{loop\}\/unlimited/, "recovery.ts must expose Type 2 unlimited loop status");
+assertNoMatch(recoverySource, /classifiers?\.ts|ClassifierDependencies/, "recovery.ts must not use legacy classifier plumbing");
+assertNoMatch(recoverySource, /\btype3\b|Type 3/, "recovery.ts must not retain legacy Type 3 recovery branches");
+assertNoMatch(recoverySource, /new\s+RegExp|_RE\b/, "recovery.ts must not reintroduce regex-based error classification");
 assertNoMatch(recoverySource, /\b(?:setTimeout|clearTimeout)\s*\(/, "recovery.ts must delegate timer primitives to src/timers.ts");
 assertNoMatch(recoverySource, /\bsendUserMessage\s*\(/, "recovery.ts must delegate safe user-message dispatch to src/actions.ts");
 assertNoMatch(recoverySource, /\bretryLastTurn\s*\(/, "recovery.ts must delegate retryLastTurn dispatch to src/actions.ts");
@@ -130,18 +147,24 @@ assertMatch(actionSource, /\bsendUserMessage\s*\(/, "src/actions.ts must own saf
 assertMatch(actionSource, /\bretryLastTurn\b/, "src/actions.ts must own safe retryLastTurn dispatch");
 assertMatch(actionSource, /triggerTurn\s*:\s*true/, "src/actions.ts must own hidden trigger-turn fallback dispatch");
 
-for (const moduleName of ["actions.ts", "classifiers.ts", "config.ts", "diagnostics.ts", "lifecycle.ts", "recovery.ts", "runtime-state.ts"]) {
+for (const moduleName of ["actions.ts", "config.ts", "diagnostics.ts", "lifecycle.ts", "recovery.ts", "runtime-state.ts"]) {
   const relativePath = `src/${moduleName}`;
   const source = readFileSync(join(srcRoot, moduleName), "utf8");
   assertNoMatch(source, /\b(?:setTimeout|clearTimeout)\s*\(/, `${relativePath} must not own timer scheduling primitives`);
 }
 
-for (const moduleName of ["classifiers.ts", "config.ts", "diagnostics.ts", "lifecycle.ts", "recovery.ts", "runtime-state.ts", "timers.ts", "types.ts"]) {
+for (const moduleName of ["config.ts", "diagnostics.ts", "lifecycle.ts", "recovery.ts", "runtime-state.ts", "timers.ts", "types.ts"]) {
   const relativePath = `src/${moduleName}`;
   const source = readFileSync(join(srcRoot, moduleName), "utf8");
   assertNoMatch(source, /\bsendUserMessage\s*\(/, `${relativePath} must not own safe sendUserMessage dispatch`);
   assertNoMatch(source, /\bsendMessage\s*\([^\n]*triggerTurn|triggerTurn\s*:\s*true/, `${relativePath} must not own hidden trigger-turn fallback dispatch`);
   assertNoMatch(source, /\bretryLastTurn\s*\(/, `${relativePath} must not own retryLastTurn dispatch`);
+}
+
+const allSources = requiredFiles.map((relativePath) => [relativePath, readTracked(relativePath)]);
+for (const [relativePath, source] of allSources) {
+  if (relativePath === "README.md" || relativePath === "README-NEW.md") continue;
+  assertNoMatch(source, /src\/classifiers\.ts|createClassifierDependencies/, `${relativePath} must not reference removed classifier module`);
 }
 
 if (failures.length > 0) {
@@ -152,4 +175,4 @@ if (failures.length > 0) {
   process.exit(1);
 }
 
-console.log(`gsd-auto-continue boundary verification passed (${requiredFiles.length} tracked files checked).`);
+console.log(`gsd-auto-continue boundary verification passed (${requiredFiles.length} tracked files checked, classifiers removed).`);

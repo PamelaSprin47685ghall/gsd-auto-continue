@@ -7,10 +7,10 @@ import type {
   SessionEndEvent,
   StopEvent,
 } from "@gsd/pi-coding-agent";
-import { getAgentEndErrorMessage, getStopErrorMessage } from "./classifiers.ts";
+import { getAgentEndErrorMessage, getStopErrorMessage } from "./recovery.ts";
 import type { createRecoveryOperations } from "./recovery.ts";
 import { consumeStopDiagnostics, rememberNotification } from "./runtime-state.ts";
-import type { ClassifierDependencies, Diagnostics, RuntimeConfig, RuntimeState, ToolErrorTurnEvent } from "./types.ts";
+import type { Diagnostics, RuntimeConfig, RuntimeState, ToolErrorTurnEvent } from "./types.ts";
 
 type RecoveryOperations = ReturnType<typeof createRecoveryOperations>;
 
@@ -18,19 +18,18 @@ export interface LifecycleRuntimeContext {
   state: RuntimeState;
   config: RuntimeConfig;
   diagnostics: Diagnostics;
-  classifiers: ClassifierDependencies;
   recovery: RecoveryOperations;
 }
 
 export function registerLifecycleHooks(pi: ExtensionAPI, runtimeContext: LifecycleRuntimeContext): void {
-  const { state, config, diagnostics, classifiers, recovery } = runtimeContext;
+  const { state, config, diagnostics, recovery } = runtimeContext;
 
   pi.on("session_start", (_event, ctx) => {
     diagnostics.bindUiNotifier(ctx);
     diagnostics.logLifecycle("hook_session_start", { reason: "session_start" });
     pi.sendMessage({
       customType: "system",
-      content: "🚀 [AutoContinue] Verbose lifecycle mode enabled. Waiting for stop/error recovery signals...",
+      content: "🚀 [AutoContinue] Two-tier recovery enabled. Type 1 preserves context; Type 2 dispatches root-cause recovery loops.",
       display: true,
     });
   });
@@ -41,7 +40,7 @@ export function registerLifecycleHooks(pi: ExtensionAPI, runtimeContext: Lifecyc
       detail: event.sessionFile,
     });
 
-    if (event.reason === "programmatic" && (state.isFixingType3 || state.retryTimers.size > 0)) {
+    if (event.reason === "programmatic" && (state.isFixingType2 || state.retryTimers.size > 0)) {
       diagnostics.logLifecycle("session_end_recovery_preserved", {
         reason: "session_end:programmatic",
         detail: "recovery_pipeline_continues_across_session_boundary",
@@ -62,28 +61,10 @@ export function registerLifecycleHooks(pi: ExtensionAPI, runtimeContext: Lifecyc
   pi.on("agent_end", (event: { messages: unknown[] }) => {
     const errorMessage = getAgentEndErrorMessage(event);
     if (!errorMessage) return;
-    if (!classifiers.classifyAsSchemaOverload(errorMessage.toLowerCase())) return;
 
-    const messages = Array.isArray(event.messages) ? event.messages : [];
-    const lastMessage = messages[messages.length - 1] as {
-      stopReason?: unknown;
-      errorMessage?: unknown;
-    } | undefined;
-
-    if (!lastMessage || lastMessage.stopReason !== "error") return;
-
-    const rawError = typeof lastMessage.errorMessage === "string" ? lastMessage.errorMessage : "";
-    if (classifiers.classifyAsNetwork(rawError)) return;
-
-    const hijackedError = rawError
-      ? `${rawError} | fetch failed (schema-overload-transient-hijack)`
-      : "fetch failed (schema-overload-transient-hijack)";
-
-    lastMessage.errorMessage = hijackedError;
-
-    diagnostics.logLifecycle("agent_end_schema_overload_hijack", {
-      reason: "schema_overload",
-      detail: hijackedError,
+    diagnostics.logLifecycle("hook_agent_end_error", {
+      reason: "assistant_error_message",
+      detail: errorMessage,
     });
   });
 
@@ -97,7 +78,7 @@ export function registerLifecycleHooks(pi: ExtensionAPI, runtimeContext: Lifecyc
     const text = String(event.text || "").trim();
     if (!text) return;
 
-    if (state.retryTimers.size > 0 && !state.isFixingType3) {
+    if (state.retryTimers.size > 0 || state.isFixingType2) {
       diagnostics.logLifecycle("hook_input_manual_intervention", {
         reason: "interactive_input_while_recovery_active",
         detail: text,
@@ -115,21 +96,10 @@ export function registerLifecycleHooks(pi: ExtensionAPI, runtimeContext: Lifecyc
       detail: message,
     });
 
-    const hasAutoPauseSignal = classifiers.hasAutoPauseContext(message);
-    const isEscapePauseBanner = classifiers.isEscapePauseBanner(message);
-
-    if (hasAutoPauseSignal) {
-      state.autoPauseSignalArmedForStop = true;
-      diagnostics.logLifecycle("auto_pause_signal_observed", {
-        reason: kind,
-        detail: "armed_for_next_stop_turn",
-      });
-    }
-
-    if (kind === "blocked" || kind === "error" || kind === "input_needed" || isEscapePauseBanner) {
-      rememberNotification(state, config, message);
+    if (kind === "blocked" || kind === "error" || kind === "input_needed" || message.trim()) {
+      rememberNotification(state, message, config.maxNotifications);
       diagnostics.logLifecycle("notification_stashed", {
-        reason: isEscapePauseBanner ? `${kind}:escape_pause_banner` : kind,
+        reason: kind,
         detail: `count=${state.lastNotifications.length}`,
       });
     }
