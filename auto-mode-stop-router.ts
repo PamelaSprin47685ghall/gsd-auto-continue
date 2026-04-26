@@ -17,23 +17,22 @@ export function registerAutoModeStopRouter(pi: ExtensionAPI) {
   const errorText = (error: unknown) => (error instanceof Error ? error.message : String(error));
 
   const notifyFallback = (content: string, type: "info" | "warning" | "error" = "error") => {
-    try {
-      lastContext?.ui.notify(content, type);
-    } catch {
+    if (!lastContext) {
+      console.error(content);
+      return false;
     }
-  };
 
-  const sendSystem = (content: string, type: "info" | "warning" | "error" = "info") => {
     try {
-      pi.sendMessage({ customType: "system", content, display: true });
+      lastContext.ui.notify(content, type);
       return true;
     } catch (error) {
-      notifyFallback(content, type);
       console.error(`[AutoContinue] Failed to send visible status: ${errorText(error)}`);
       console.error(content);
       return false;
     }
   };
+
+  const sendSystem = (content: string, type: "info" | "warning" | "error" = "info") => notifyFallback(content, type);
 
   const reportInternalFailure = (phase: string, error: unknown) => {
     sendSystem(
@@ -62,23 +61,10 @@ export function registerAutoModeStopRouter(pi: ExtensionAPI) {
     }
   };
 
-  const sendFollowUp = (content: string) => {
-    sendSystem("↪️ [AutoContinue] Queueing recovery follow-up before abort.");
-
-    try {
-      pi.sendUserMessage(content, { deliverAs: "followUp" });
-      return true;
-    } catch (error) {
-      sendSystem(`❌ [AutoContinue] Failed to queue recovery follow-up visibly: ${errorText(error)}.`, "error");
-      return false;
-    }
-  };
-
   const withoutContext = createWithoutContextRecovery({ sendSystem, sendUserMessage });
   const withContext = createWithContextContinuation({
     sendSystem,
     sendUserMessage,
-    sendFollowUp,
     isWithoutContextRecoveryRunning: () => withoutContext.recovering,
   });
 
@@ -105,6 +91,7 @@ export function registerAutoModeStopRouter(pi: ExtensionAPI) {
   const recoveringProgrammatically = () => withContext.active || withoutContext.active;
   const resumeCommand = (stepMode: boolean) => (stepMode ? "/gsd next" : CONTINUATION_POLICY.resumeCommand);
   const recoverableGsdPause = (reason: StopEvent["reason"], errorContext: unknown) => reason !== "cancelled" || errorContext !== undefined;
+  const isAutoGuardEnabled = (snapshot: Awaited<ReturnType<typeof readGsdAutoSnapshot>>) => snapshot?.active === true;
 
   const isGsdPaused = (snapshot: Awaited<ReturnType<typeof readGsdAutoSnapshot>>) =>
     snapshot?.paused === true && snapshot.active === false ? snapshot : undefined;
@@ -142,13 +129,15 @@ export function registerAutoModeStopRouter(pi: ExtensionAPI) {
     withContext.resetIdenticalToolCallLoop();
   });
 
-  onSafe("tool_call", (event, ctx) => {
+  onSafe("tool_call", async (event, ctx) => {
     if (!ctx) return undefined;
+    if (!isAutoGuardEnabled(await readGsdAutoSnapshot())) return undefined;
     return withContext.handleToolCallLoop(event as ToolCallLoopEvent, ctx);
   });
 
-  onSafe("tool_execution_end", (event, ctx) => {
+  onSafe("tool_execution_end", async (event, ctx) => {
     if (!ctx) return;
+    if (!isAutoGuardEnabled(await readGsdAutoSnapshot())) return;
     withContext.handleToolExecutionEnd(event as ToolExecutionEndLoopEvent & ToolExecutionEndEvent, ctx);
   });
 
@@ -184,8 +173,6 @@ export function registerAutoModeStopRouter(pi: ExtensionAPI) {
       return;
     }
 
-    if (withContext.handleProgrammaticAbort()) return;
-
     const gsdSnapshot = await readGsdAutoSnapshot();
     const pausedAuto = isGsdPaused(gsdSnapshot);
     if (pausedAuto && recoverableGsdPause(stop.reason, pausedAuto.errorContext)) {
@@ -205,6 +192,8 @@ export function registerAutoModeStopRouter(pi: ExtensionAPI) {
       );
       return;
     }
+
+    if (withContext.handleProgrammaticAbort()) return;
 
     if (await isContextOverflow(stop.lastMessage, lastContext?.getContextUsage()?.contextWindow)) {
       withContext.standDown();

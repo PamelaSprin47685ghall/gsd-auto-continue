@@ -18,14 +18,12 @@ export type ToolExecutionEndLoopEvent = {
 type WithContextContinuationOptions = {
   sendSystem(content: string): void;
   sendUserMessage(content: string): void;
-  sendFollowUp(content: string): boolean;
   isWithoutContextRecoveryRunning(): boolean;
 };
 
 type ArmedAbort = {
   reason: string;
   detail: string;
-  followUpQueued: boolean;
 };
 
 const PREPARATION_ERROR_PATTERNS = [
@@ -80,7 +78,6 @@ const retryPrompt = (reason: string, detail: string) =>
 export function createWithContextContinuation({
   sendSystem,
   sendUserMessage,
-  sendFollowUp,
   isWithoutContextRecoveryRunning,
 }: WithContextContinuationOptions) {
   let attempts = 0;
@@ -139,14 +136,11 @@ export function createWithContextContinuation({
     }, delayMs);
   };
 
-  const abortForRetry = (ctx: ExtensionContext, systemMessage: string, abort: Omit<ArmedAbort, "followUpQueued">) => {
+  const abortForRetry = (ctx: ExtensionContext, systemMessage: string, abort: ArmedAbort) => {
     if (armedAbort) return { block: true, reason: abort.detail };
 
     sendSystem(systemMessage);
-    armedAbort = {
-      ...abort,
-      followUpQueued: sendFollowUp(retryPrompt(abort.reason, abort.detail)),
-    };
+    armedAbort = abort;
 
     try {
       ctx.abort();
@@ -190,7 +184,7 @@ export function createWithContextContinuation({
 
       return abortForRetry(
         ctx,
-        `⚠️ [AutoContinue] ${event.toolName} is repeating identical arguments. Queueing recovery before aborting this turn.`,
+        `⚠️ [AutoContinue] ${event.toolName} is repeating identical arguments. Aborting this turn; recovery will dispatch after stop.`,
         {
           reason: "identical_tool_call_guard",
           detail: `${event.toolName} was called ${identicalToolCallCount} consecutive times with identical arguments; retry with a different approach before GSD's fifth-call loop guard fires.`,
@@ -211,7 +205,7 @@ export function createWithContextContinuation({
 
       if (consecutivePreparationToolResults < CONTINUATION_POLICY.maxPreparationErrorTurnsBeforeAbort) return;
 
-      abortForRetry(ctx, "⚠️ [AutoContinue] Tool-call schema failures are repeating. Queueing recovery before aborting this turn.", {
+      abortForRetry(ctx, "⚠️ [AutoContinue] Tool-call schema failures are repeating. Aborting this turn; recovery will dispatch after stop.", {
         reason: "tool_schema_guard",
         detail:
           "Two consecutive tool calls failed before execution; retry with corrected tool arguments before Pi's three-turn schema-overload interrupt fires.",
@@ -223,11 +217,6 @@ export function createWithContextContinuation({
 
       const abort = armedAbort;
       resetRecoveryGuards();
-      if (abort.followUpQueued) {
-        sendSystem("✅ [AutoContinue] Recovery follow-up was already queued before abort; not dispatching a duplicate retry.");
-        return true;
-      }
-
       scheduleRetry(abort.reason, abort.detail);
       return true;
     },
