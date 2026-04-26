@@ -36,21 +36,21 @@ test("ordinary failures retry in the current context and do not restart auto-mod
   assert.notEqual(harness.userMessages[0].trim(), "/gsd auto");
 });
 
-test("schema-preparation failures abort one turn before Pi's three-turn cap", async (t) => {
+test("schema-preparation tool results abort before the provider can make a third call", async (t) => {
   const harness = await createHarness(t);
   const context = createContext();
 
-  await harness.handler("turn_end")({ type: "turn_end", toolResults: [validationError()] }, context.ctx);
+  await harness.handler("tool_result")({ type: "tool_result", toolName: "gsd_plan_slice", ...validationError() }, context.ctx);
   assert.equal(context.aborts.length, 0);
 
-  await harness.handler("turn_end")({ type: "turn_end", toolResults: [validationError()] }, context.ctx);
+  await harness.handler("tool_result")({ type: "tool_result", toolName: "gsd_plan_slice", ...validationError() }, context.ctx);
   assert.equal(context.aborts.length, 1);
   assert.match(harness.systemMessages.at(-1).message.content, /schema failures are repeating/);
 
   await stop(harness, "error", "Operation aborted");
   await harness.timers.flushNext();
 
-  assert.match(harness.userMessages.at(-1), /Two consecutive turns had all tool calls fail before execution/);
+  assert.match(harness.userMessages.at(-1), /Two consecutive tool calls failed before execution/);
   assert.notEqual(harness.userMessages.at(-1).trim(), "/gsd auto");
   assert.doesNotMatch(harness.systemMessages.at(-1).message.content, /Manual intervention detected/);
 });
@@ -59,32 +59,46 @@ test("ordinary tool execution errors do not count toward the schema guard", asyn
   const harness = await createHarness(t);
   const context = createContext();
 
-  await harness.handler("turn_end")({ type: "turn_end", toolResults: [executionError()] }, context.ctx);
-  await harness.handler("turn_end")({ type: "turn_end", toolResults: [executionError()] }, context.ctx);
-  await harness.handler("turn_end")({ type: "turn_end", toolResults: [executionError()] }, context.ctx);
+  await harness.handler("tool_result")({ type: "tool_result", toolName: "bash", ...executionError() }, context.ctx);
+  await harness.handler("tool_result")({ type: "tool_result", toolName: "bash", ...executionError() }, context.ctx);
+  await harness.handler("tool_result")({ type: "tool_result", toolName: "bash", ...executionError() }, context.ctx);
 
   assert.equal(context.aborts.length, 0);
 });
 
-test("mixed preparation and successful tool turns preserve but do not increment the schema guard", async (t) => {
+test("successful and execution-error tool results reset the schema guard", async (t) => {
   const harness = await createHarness(t);
   const context = createContext();
 
-  await harness.handler("turn_end")({ type: "turn_end", toolResults: [validationError()] }, context.ctx);
-  await harness.handler("turn_end")({ type: "turn_end", toolResults: [validationError(), success()] }, context.ctx);
+  await harness.handler("tool_result")({ type: "tool_result", toolName: "gsd_plan_slice", ...validationError() }, context.ctx);
+  await harness.handler("tool_result")({ type: "tool_result", toolName: "bash", ...executionError() }, context.ctx);
+  await harness.handler("tool_result")({ type: "tool_result", toolName: "gsd_plan_slice", ...validationError() }, context.ctx);
   assert.equal(context.aborts.length, 0);
 
-  await harness.handler("turn_end")({ type: "turn_end", toolResults: [validationError()] }, context.ctx);
-  assert.equal(context.aborts.length, 1);
+  await harness.handler("tool_result")({ type: "tool_result", toolName: "read", ...success() }, context.ctx);
+  await harness.handler("tool_result")({ type: "tool_result", toolName: "gsd_plan_slice", ...validationError() }, context.ctx);
+  assert.equal(context.aborts.length, 0);
 });
 
-test("successful turns reset the schema guard", async (t) => {
+test("mixed preparation and successful tool results preserve but do not increment the schema guard", async (t) => {
   const harness = await createHarness(t);
   const context = createContext();
 
-  await harness.handler("turn_end")({ type: "turn_end", toolResults: [validationError()] }, context.ctx);
-  await harness.handler("turn_end")({ type: "turn_end", toolResults: [success()] }, context.ctx);
-  await harness.handler("turn_end")({ type: "turn_end", toolResults: [validationError()] }, context.ctx);
+  await harness.handler("tool_result")({ type: "tool_result", toolName: "gsd_plan_slice", ...validationError() }, context.ctx);
+  await harness.handler("tool_result")({ type: "tool_result", toolName: "read", ...success() }, context.ctx);
+  assert.equal(context.aborts.length, 0);
+
+  await harness.handler("tool_result")({ type: "tool_result", toolName: "gsd_plan_slice", ...validationError() }, context.ctx);
+  assert.equal(context.aborts.length, 0);
+});
+
+test("successful tool results reset the schema guard", async (t) => {
+  const harness = await createHarness(t);
+  const context = createContext();
+
+  await harness.handler("tool_result")({ type: "tool_result", toolName: "gsd_plan_slice", ...validationError() }, context.ctx);
+  await harness.handler("tool_result")({ type: "tool_result", toolName: "read", ...success() }, context.ctx);
+  await harness.handler("tool_result")({ type: "tool_result", toolName: "gsd_plan_slice", ...validationError() }, context.ctx);
 
   assert.equal(context.aborts.length, 0);
 });

@@ -11,7 +11,7 @@ const REGISTERED_HOOKS = [
   "session_start",
   "stop",
   "tool_call",
-  "turn_end",
+  "tool_result",
 ];
 
 test("registers only the hooks the extension actually uses", async (t) => {

@@ -4,16 +4,14 @@ import { CONTINUATION_POLICY } from "./continuation-policy.ts";
 
 type TextContent = { type?: string; text?: unknown };
 
-export type ToolErrorTurnEvent = {
-  toolResults?: Array<{
-    isError?: boolean;
-    content?: TextContent[];
-  }>;
-};
-
 export type ToolCallLoopEvent = {
   toolName?: unknown;
   input?: unknown;
+};
+
+export type ToolResultEvent = {
+  isError?: boolean;
+  content?: TextContent[];
 };
 
 type WithContextContinuationOptions = {
@@ -73,7 +71,7 @@ export function createWithContextContinuation({
 }: WithContextContinuationOptions) {
   let attempts = 0;
   let timer: ReturnType<typeof setTimeout> | null = null;
-  let preparationErrorTurns = 0;
+  let consecutivePreparationToolResults = 0;
   let identicalToolCallCount = 0;
   let lastToolCallSignature = "";
   let armedAbort: ArmedAbort | null = null;
@@ -85,7 +83,7 @@ export function createWithContextContinuation({
   };
 
   const resetPreparationErrorGuard = () => {
-    preparationErrorTurns = 0;
+    consecutivePreparationToolResults = 0;
   };
 
   const resetIdenticalToolCallLoop = () => {
@@ -185,25 +183,23 @@ export function createWithContextContinuation({
       );
     },
 
-    handleToolErrors(event: ToolErrorTurnEvent, ctx: ExtensionContext) {
+    handleToolResult(event: ToolResultEvent, ctx: ExtensionContext) {
       if (isWithoutContextRecoveryRunning()) return;
 
-      const results = Array.isArray(event.toolResults) ? event.toolResults : [];
-      if (results.length === 0 || results.some((result) => result == null || typeof result.isError !== "boolean")) return;
+      if (typeof event.isError !== "boolean") return;
 
-      const preparationErrors = results.filter(isPreparationError).length;
-      if (preparationErrors === results.length) {
-        preparationErrorTurns += 1;
-      } else if (preparationErrors === 0) {
-        resetPreparationErrorGuard();
+      if (isPreparationError(event)) {
+        consecutivePreparationToolResults += 1;
+      } else {
+        consecutivePreparationToolResults = 0;
       }
 
-      if (preparationErrorTurns < CONTINUATION_POLICY.maxPreparationErrorTurnsBeforeAbort) return;
+      if (consecutivePreparationToolResults < CONTINUATION_POLICY.maxPreparationErrorTurnsBeforeAbort) return;
 
-      abortForRetry(ctx, "⚠️ [AutoContinue] Tool-call schema failures are repeating. Aborting this turn and retrying with context.", {
+      abortForRetry(ctx, "⚠️ [AutoContinue] Tool-call schema failures are repeating. Aborting before the provider can issue a third invalid call.", {
         reason: "tool_schema_guard",
         detail:
-          "Two consecutive turns had all tool calls fail before execution; retry with corrected tool arguments before Pi's three-turn schema-overload interrupt fires.",
+          "Two consecutive tool calls failed before execution; retry with corrected tool arguments before Pi's three-turn schema-overload interrupt fires.",
       });
     },
 

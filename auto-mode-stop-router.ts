@@ -1,6 +1,6 @@
 import type { ExtensionAPI, InputEvent, NotificationEvent, SessionEndEvent, StopEvent } from "@gsd/pi-coding-agent";
 import { CONTINUATION_POLICY, WITHOUT_CONTEXT_STOP_PHRASES, matchesManualIntervention } from "./continuation-policy.ts";
-import { createWithContextContinuation, type ToolCallLoopEvent, type ToolErrorTurnEvent } from "./with-context-continuation.ts";
+import { createWithContextContinuation, type ToolCallLoopEvent, type ToolResultEvent } from "./with-context-continuation.ts";
 import { createWithoutContextRecovery } from "./without-context-recovery.ts";
 
 const includesAny = (text: string, phrases: readonly string[]) =>
@@ -75,8 +75,8 @@ export function registerAutoModeStopRouter(pi: ExtensionAPI) {
 
   pi.on("tool_call", (event: ToolCallLoopEvent, ctx) => withContext.handleToolCallLoop(event, ctx));
 
-  pi.on("turn_end", (event: ToolErrorTurnEvent, ctx) => {
-    withContext.handleToolErrors(event, ctx);
+  pi.on("tool_result", (event: ToolResultEvent, ctx) => {
+    withContext.handleToolResult(event, ctx);
   });
 
   pi.on("input", (event: InputEvent) => {
