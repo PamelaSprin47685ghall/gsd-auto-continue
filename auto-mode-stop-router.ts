@@ -108,11 +108,6 @@ export function registerAutoModeStopRouter(pi: ExtensionAPI) {
 
     if (withContext.handleProgrammaticAbort()) return;
 
-    if (event.reason === "cancelled") {
-      standDown(true);
-      return;
-    }
-
     if (/\boperation aborted\b/i.test(detail)) {
       standDown(true);
       return;
@@ -126,6 +121,11 @@ export function registerAutoModeStopRouter(pi: ExtensionAPI) {
     if (includesAny(detail, WITHOUT_CONTEXT_STOP_PHRASES)) {
       withContext.standDown();
       withoutContext.scheduleRecovery(detail || String(event.reason));
+      return;
+    }
+
+    if (event.reason === "cancelled") {
+      standDown(true);
       return;
     }
 
