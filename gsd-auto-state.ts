@@ -169,6 +169,16 @@ export const setContextOverflowDetectorForTests = (detector: ContextOverflowDete
   overrideContextOverflowDetector = detector;
 };
 
+export const importInstalledGsdModule = async <T>(relativePath: string) => {
+  for (const autoPath of autoCandidates()) {
+    const packageRoot = packageRootFromAutoPath(autoPath);
+    const module = await importModule<T>(packageRoot ? join(packageRoot, relativePath) : undefined);
+    if (module) return module;
+  }
+
+  return undefined;
+};
+
 export const readGsdAutoSnapshot = async () => {
   if (overrideReader) return overrideReader();
 
