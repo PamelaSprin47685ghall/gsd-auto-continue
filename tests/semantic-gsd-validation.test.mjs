@@ -270,7 +270,7 @@ test("agent patch exposes original schemas to provider while keeping internal se
   assert.equal(agent.state.tools[0], originalGsdTool);
 });
 
-test("agent patch wraps gsd-auto custom prompt even when dashboard snapshot is not active", async () => {
+test("agent patch wraps current gsd-auto custom prompt without global state", async () => {
   class FakeAgent {
     constructor(tools) {
       this.state = { tools, messages: [] };
@@ -304,7 +304,7 @@ test("agent patch wraps gsd-auto custom prompt even when dashboard snapshot is n
   assert.equal(agent.state.tools[0], originalGsdTool);
 });
 
-test("agent patch wraps continue when current session contains a gsd-auto message", async () => {
+test("agent patch ignores historical gsd-auto messages outside active auto-mode", async () => {
   class FakeAgent {
     constructor(tools) {
       this.state = {
@@ -328,6 +328,38 @@ test("agent patch wraps continue when current session contains a gsd-auto messag
     AgentClass: FakeAgent,
     validateToolArguments: () => ({ ok: "validated" }),
     isEnabled: () => false,
+  });
+
+  const originalGsdTool = gsdTool();
+  const agent = new FakeAgent([originalGsdTool]);
+
+  await agent.continue();
+
+  assert.equal(agent.continueTools[0], originalGsdTool);
+  assert.equal(agent.state.tools[0], originalGsdTool);
+});
+
+test("agent patch wraps continue only when local auto-mode is active", async () => {
+  class FakeAgent {
+    constructor(tools) {
+      this.state = { tools };
+    }
+
+    setTools(tools) {
+      this.state.tools = tools;
+    }
+
+    async prompt() {}
+
+    async continue() {
+      this.continueTools = this.state.tools;
+    }
+  }
+
+  await installSemanticGsdValidationPatch({
+    AgentClass: FakeAgent,
+    validateToolArguments: () => ({ ok: "validated" }),
+    isEnabled: () => true,
   });
 
   const originalGsdTool = gsdTool();

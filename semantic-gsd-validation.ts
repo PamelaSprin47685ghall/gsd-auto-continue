@@ -1,4 +1,4 @@
-import { importInstalledGsdModule, readGsdAutoSnapshot } from "./gsd-auto-state.ts";
+import { importInstalledGsdModule } from "./gsd-auto-state.ts";
 
 type ToolContent = { type: "text"; text: string };
 type ToolResult = { content: ToolContent[]; details?: unknown };
@@ -172,7 +172,7 @@ async function defaultValidator(tool: AgentTool, toolCall: { id: string; name: s
 }
 
 async function defaultEnabled() {
-  return (await readGsdAutoSnapshot())?.active === true;
+  return false;
 }
 
 export function wrapGsdToolForSemanticValidation(tool: AgentTool, validateToolArguments: Validator): AgentTool {
@@ -213,8 +213,8 @@ const withOriginalProviderSchemas = (agent: AgentLike, run: () => Promise<unknow
   });
 };
 
-async function shouldEnableSemanticValidation(agent: AgentLike, options: Required<InstallOptions>, runArgs: unknown[]) {
-  return hasGsdAutoMessage(runArgs[0]) || hasGsdAutoMessage(agent.state?.messages) || await options.isEnabled();
+async function shouldEnableSemanticValidation(_agent: AgentLike, options: Required<InstallOptions>, runArgs: unknown[]) {
+  return hasGsdAutoMessage(runArgs[0]) || await options.isEnabled();
 }
 
 async function withSemanticGsdValidation<T>(agent: AgentLike, options: Required<InstallOptions>, runArgs: unknown[], run: () => Promise<T>) {

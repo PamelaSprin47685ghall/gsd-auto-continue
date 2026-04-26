@@ -1,6 +1,7 @@
 import type { ExtensionAPI } from "@gsd/pi-coding-agent";
 import { registerAutoModeStopRouter } from "./auto-mode-stop-router.ts";
 import { installSemanticGsdValidationPatch } from "./semantic-gsd-validation.ts";
+import { isLocalGsdAutoActive, resetLocalGsdAutoRunState } from "./local-gsd-auto-state.ts";
 
 const INSTALL_FAILURE_REPORTED = Symbol.for("gsd-auto-continue.semantic-gsd-validation.install-failure-reported");
 
@@ -12,8 +13,9 @@ const reportInstallFailureOnce = (error: unknown) => {
 };
 
 export default async function registerExtension(pi: ExtensionAPI) {
+  resetLocalGsdAutoRunState();
   try {
-    await installSemanticGsdValidationPatch();
+    await installSemanticGsdValidationPatch({ isEnabled: isLocalGsdAutoActive });
   } catch (error) {
     reportInstallFailureOnce(error);
   }

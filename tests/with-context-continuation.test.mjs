@@ -3,11 +3,16 @@ import assert from "node:assert/strict";
 import { createContext, createHarness, notify, stop } from "./harness.mjs";
 
 const { matchesManualIntervention } = await import(new URL("../continuation-policy.ts", import.meta.url).href);
-const { setGsdAutoSnapshotReaderForTests } = await import(new URL("../gsd-auto-state.ts", import.meta.url).href);
 
-function withAutoActive(t) {
-  setGsdAutoSnapshotReaderForTests(async () => ({ active: true, paused: false, stepMode: false, basePath: "/repo" }));
-  t.after(() => setGsdAutoSnapshotReaderForTests(undefined));
+async function markAutoActive(harness, overrides = {}) {
+  await harness.handler("unit_start")({
+    type: "unit_start",
+    unitType: "execute-task",
+    unitId: "M001/S01/T01",
+    milestoneId: "M001",
+    cwd: "/repo",
+    ...overrides,
+  });
 }
 
 const validationError = (text = "Validation failed for tool \"write\": missing required property") => ({
@@ -36,8 +41,8 @@ test("ordinary stop errors do not trigger recovery", async (t) => {
 });
 
 test("active auto-mode blocked stops start without-context recovery", async (t) => {
-  withAutoActive(t);
   const harness = await createHarness(t);
+  await markAutoActive(harness);
   const context = createContext();
 
   await notify(
@@ -56,8 +61,8 @@ test("active auto-mode blocked stops start without-context recovery", async (t) 
 });
 
 test("active auto-mode stop errors retry with current context", async (t) => {
-  withAutoActive(t);
   const harness = await createHarness(t);
+  await markAutoActive(harness);
   const context = createContext();
   const providerError = 'Error: {"error":{"message":"","code":502,"status":"Bad Gateway"}}';
 
@@ -73,8 +78,8 @@ test("active auto-mode stop errors retry with current context", async (t) => {
 });
 
 test("schema-preparation tool results abort before the provider can make a third call", async (t) => {
-  withAutoActive(t);
   const harness = await createHarness(t);
+  await markAutoActive(harness);
   const context = createContext();
 
   await harness.handler("tool_execution_end")({ type: "tool_execution_end", toolName: "gsd_plan_slice", ...validationError() }, context.ctx);
@@ -93,8 +98,8 @@ test("schema-preparation tool results abort before the provider can make a third
 });
 
 test("semantic GSD failures abort before repeated retry loops continue", async (t) => {
-  withAutoActive(t);
   const harness = await createHarness(t);
+  await markAutoActive(harness);
   const context = createContext();
   const semanticFailure = {
     isError: false,
@@ -144,8 +149,8 @@ test("non-auto GSD schema-preparation failures do not trigger recovery", async (
 });
 
 test("ordinary tool validation failures do not trigger recovery", async (t) => {
-  withAutoActive(t);
   const harness = await createHarness(t);
+  await markAutoActive(harness);
   const context = createContext();
 
   await harness.handler("tool_execution_end")({ type: "tool_execution_end", toolName: "lsp", ...validationError('Validation failed for tool "lsp": missing action') }, context.ctx);
@@ -158,8 +163,8 @@ test("ordinary tool validation failures do not trigger recovery", async (t) => {
 });
 
 test("schema-preparation guard recognizes validation errors after tool-name prefixes", async (t) => {
-  withAutoActive(t);
   const harness = await createHarness(t);
+  await markAutoActive(harness);
   const context = createContext();
   const prefixedValidationError = validationError('gsd_plan_slice\nValidation failed for tool "gsd_plan_slice":\n  - tasks: must be array');
 
@@ -173,8 +178,8 @@ test("schema-preparation guard recognizes validation errors after tool-name pref
 });
 
 test("ordinary tool execution errors do not count toward the schema guard", async (t) => {
-  withAutoActive(t);
   const harness = await createHarness(t);
+  await markAutoActive(harness);
   const context = createContext();
 
   await harness.handler("tool_execution_end")({ type: "tool_execution_end", toolName: "bash", ...executionError() }, context.ctx);
@@ -185,8 +190,8 @@ test("ordinary tool execution errors do not count toward the schema guard", asyn
 });
 
 test("successful and execution-error tool results reset the schema guard", async (t) => {
-  withAutoActive(t);
   const harness = await createHarness(t);
+  await markAutoActive(harness);
   const context = createContext();
 
   await harness.handler("tool_execution_end")({ type: "tool_execution_end", toolName: "gsd_plan_slice", ...validationError() }, context.ctx);
@@ -200,8 +205,8 @@ test("successful and execution-error tool results reset the schema guard", async
 });
 
 test("mixed preparation and successful tool results preserve but do not increment the schema guard", async (t) => {
-  withAutoActive(t);
   const harness = await createHarness(t);
+  await markAutoActive(harness);
   const context = createContext();
 
   await harness.handler("tool_execution_end")({ type: "tool_execution_end", toolName: "gsd_plan_slice", ...validationError() }, context.ctx);
@@ -213,8 +218,8 @@ test("mixed preparation and successful tool results preserve but do not incremen
 });
 
 test("successful tool results reset the schema guard", async (t) => {
-  withAutoActive(t);
   const harness = await createHarness(t);
+  await markAutoActive(harness);
   const context = createContext();
 
   await harness.handler("tool_execution_end")({ type: "tool_execution_end", toolName: "gsd_plan_slice", ...validationError() }, context.ctx);
@@ -225,8 +230,8 @@ test("successful tool results reset the schema guard", async (t) => {
 });
 
 test("identical tool calls abort on the fourth call before GSD blocks the fifth", async (t) => {
-  withAutoActive(t);
   const harness = await createHarness(t);
+  await markAutoActive(harness);
   const context = createContext();
   const event = { type: "tool_call", toolName: "read", input: { path: "README.md" } };
 
@@ -264,8 +269,8 @@ test("non-auto identical tool calls do not trigger recovery", async (t) => {
 });
 
 test("different tool arguments reset the identical-call guard", async (t) => {
-  withAutoActive(t);
   const harness = await createHarness(t);
+  await markAutoActive(harness);
   const context = createContext();
 
   await harness.handler("tool_call")({ type: "tool_call", toolName: "read", input: { path: "A.md" } }, context.ctx);
@@ -278,8 +283,8 @@ test("different tool arguments reset the identical-call guard", async (t) => {
 });
 
 test("agent boundaries reset the identical-call guard", async (t) => {
-  withAutoActive(t);
   const harness = await createHarness(t);
+  await markAutoActive(harness);
   const context = createContext();
   const event = { type: "tool_call", toolName: "read", input: { path: "README.md" } };
 
@@ -293,8 +298,8 @@ test("agent boundaries reset the identical-call guard", async (t) => {
 });
 
 test("strict interactive duplicate tools are left to GSD's own guard", async (t) => {
-  withAutoActive(t);
   const harness = await createHarness(t);
+  await markAutoActive(harness);
   const context = createContext();
   const event = { type: "tool_call", toolName: "ask_user_questions", input: { questions: [{ id: "gate", options: [] }] } };
 
@@ -334,8 +339,8 @@ test("provider errors do not count as manual intervention", async (t) => {
 });
 
 test("manual intervention cancels pending fallback retry", async (t) => {
-  withAutoActive(t);
   const harness = await createHarness(t, { throwSendUserMessage: true });
+  await markAutoActive(harness);
   const context = await armFallbackSchemaRetry(harness);
 
   await notify(harness, "manual intervention requested by operator", "input_needed");
@@ -346,8 +351,8 @@ test("manual intervention cancels pending fallback retry", async (t) => {
 });
 
 test("manual operation abort cancels pending fallback retry when it was not self-triggered", async (t) => {
-  withAutoActive(t);
   const harness = await createHarness(t, { throwSendUserMessage: true });
+  await markAutoActive(harness);
   const context = await armFallbackSchemaRetry(harness);
 
   await stop(harness, "error", "Operation aborted", context.ctx);
@@ -366,8 +371,8 @@ test("official stop and review notifications cancel pending fallback retry", asy
     "Provider requires human input before continuing.",
     "Recovery stopped because operator action is required.",
   ]) {
-    withAutoActive(t);
     const harness = await createHarness(t, { throwSendUserMessage: true });
+    await markAutoActive(harness);
     const context = await armFallbackSchemaRetry(harness);
 
     await notify(harness, message, "warning");

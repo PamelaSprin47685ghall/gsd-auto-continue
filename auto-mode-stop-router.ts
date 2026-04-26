@@ -2,7 +2,8 @@ import type { ExtensionAPI, ExtensionContext, InputEvent, NotificationEvent, Ses
 import { CONTINUATION_POLICY, matchesManualIntervention } from "./continuation-policy.ts";
 import { createWithContextContinuation, type ToolCallLoopEvent, type ToolExecutionEndLoopEvent } from "./with-context-continuation.ts";
 import { createWithoutContextRecovery } from "./without-context-recovery.ts";
-import { readGsdAutoSnapshot, isContextOverflow } from "./gsd-auto-state.ts";
+import { isContextOverflow } from "./gsd-auto-state.ts";
+import { clearLocalGsdAutoRecoverable, getLocalGsdAutoRunState, markLocalGsdAutoUnitEnded, markLocalGsdAutoUnitStarted, resetLocalGsdAutoRunState } from "./local-gsd-auto-state.ts";
 
 const stopError = (event: StopEvent) => {
   const lastMessage = event.lastMessage as { errorMessage?: unknown } | undefined;
@@ -90,15 +91,9 @@ export function registerAutoModeStopRouter(pi: ExtensionAPI) {
 
   const recoveringProgrammatically = () => withContext.active || withoutContext.active;
   const resumeCommand = (stepMode: boolean) => (stepMode ? "/gsd next" : CONTINUATION_POLICY.resumeCommand);
-  const recoverableGsdPause = (reason: StopEvent["reason"], errorContext: unknown) => reason !== "cancelled" || errorContext !== undefined;
-  const isAutoGuardEnabled = (snapshot: Awaited<ReturnType<typeof readGsdAutoSnapshot>>) => snapshot?.active === true;
+  const isAutoGuardEnabled = () => getLocalGsdAutoRunState().active;
 
-  const isGsdPaused = (snapshot: Awaited<ReturnType<typeof readGsdAutoSnapshot>>) =>
-    snapshot?.paused === true && snapshot.active === false ? snapshot : undefined;
-
-  const isRecoverableGsdStop = (snapshot: Awaited<ReturnType<typeof readGsdAutoSnapshot>>) =>
-    snapshot?.active === false &&
-    (snapshot.errorContext?.category === "session-failed" || snapshot.errorContext?.category === "timeout" || snapshot.errorContext?.category === "pre-execution");
+  const recoveryMessage = (category: string, detail: string) => `${category}: ${detail || "GSD auto-mode stopped before completing the current unit."}`;
 
   const onSafe = (eventName: string, handler: (event: unknown, ctx?: ExtensionContext) => unknown) => {
     pi.on(eventName as never, async (event: unknown, ctx?: ExtensionContext) => {
@@ -122,7 +117,16 @@ export function registerAutoModeStopRouter(pi: ExtensionAPI) {
   onSafe("session_shutdown", () => standDown(false));
 
   onSafe("session_start", () => {
+    resetLocalGsdAutoRunState();
     withContext.resetIdenticalToolCallLoop();
+  });
+
+  onSafe("unit_start", (event) => {
+    markLocalGsdAutoUnitStarted(event as { unitType?: unknown });
+  });
+
+  onSafe("unit_end", (event) => {
+    markLocalGsdAutoUnitEnded(event as { status?: unknown; unitType?: unknown; unitId?: unknown });
   });
 
   onSafe("agent_end", () => {
@@ -131,13 +135,13 @@ export function registerAutoModeStopRouter(pi: ExtensionAPI) {
 
   onSafe("tool_call", async (event, ctx) => {
     if (!ctx) return undefined;
-    if (!isAutoGuardEnabled(await readGsdAutoSnapshot())) return undefined;
+    if (!isAutoGuardEnabled()) return undefined;
     return withContext.handleToolCallLoop(event as ToolCallLoopEvent, ctx);
   });
 
   onSafe("tool_execution_end", async (event, ctx) => {
     if (!ctx) return;
-    if (!isAutoGuardEnabled(await readGsdAutoSnapshot())) return;
+    if (!isAutoGuardEnabled()) return;
     withContext.handleToolExecutionEnd(event as ToolExecutionEndLoopEvent & ToolExecutionEndEvent, ctx);
   });
 
@@ -173,43 +177,16 @@ export function registerAutoModeStopRouter(pi: ExtensionAPI) {
       return;
     }
 
-    const gsdSnapshot = await readGsdAutoSnapshot();
-    const pausedAuto = isGsdPaused(gsdSnapshot);
-    if (pausedAuto && recoverableGsdPause(stop.reason, pausedAuto.errorContext)) {
+    const autoRun = getLocalGsdAutoRunState();
+    const recoverable = autoRun.recoverable;
+    if (recoverable && stop.reason !== "cancelled") {
       withContext.standDown();
-      withoutContext.scheduleRecovery(
-        pausedAuto.errorContext ? `${pausedAuto.errorContext.category}: ${pausedAuto.errorContext.message}` : detail || String(stop.reason),
-        resumeCommand(pausedAuto.stepMode),
-      );
-      return;
-    }
-
-    if (isRecoverableGsdStop(gsdSnapshot)) {
-      withContext.standDown();
-      withoutContext.scheduleRecovery(
-        `${gsdSnapshot.errorContext!.category}: ${gsdSnapshot.errorContext!.message}`,
-        resumeCommand(gsdSnapshot.stepMode),
-      );
+      clearLocalGsdAutoRecoverable();
+      withoutContext.scheduleRecovery(recoveryMessage(recoverable.category, detail || recoverable.message), resumeCommand(autoRun.stepMode));
       return;
     }
 
     if (withContext.handleProgrammaticAbort()) return;
-
-    if (stop.lastMessage && await isContextOverflow(stop.lastMessage, lastContext?.getContextUsage()?.contextWindow)) {
-      withContext.standDown();
-
-      if (!overflowDelegatedToCore) {
-        overflowDelegatedToCore = true;
-        withoutContext.cancelPending();
-        sendSystem("ℹ️ [AutoContinue] Context overflow detected. Standing down while Pi core runs its overflow compaction recovery.");
-        return;
-      }
-
-      withoutContext.scheduleRecovery(detail || "context overflow");
-      return;
-    }
-
-    overflowDelegatedToCore = false;
 
     if (/\boperation aborted\b/i.test(detail)) {
       standDown(true);
@@ -226,13 +203,29 @@ export function registerAutoModeStopRouter(pi: ExtensionAPI) {
       return;
     }
 
-    if (gsdSnapshot?.active === true && stop.reason === "blocked") {
+    if (stop.lastMessage && await isContextOverflow(stop.lastMessage, lastContext?.getContextUsage()?.contextWindow)) {
       withContext.standDown();
-      withoutContext.scheduleRecovery(detail || "GSD auto-mode blocked before completing the current unit.", resumeCommand(gsdSnapshot.stepMode));
+
+      if (!overflowDelegatedToCore) {
+        overflowDelegatedToCore = true;
+        withoutContext.cancelPending();
+        sendSystem("ℹ️ [AutoContinue] Context overflow detected. Standing down while Pi core runs its overflow compaction recovery.");
+        return;
+      }
+
+      withoutContext.scheduleRecovery(detail || "context overflow");
       return;
     }
 
-    if (gsdSnapshot?.active === true && stop.reason === "error") {
+
+    overflowDelegatedToCore = false;
+    if (autoRun.active && stop.reason === "blocked") {
+      withContext.standDown();
+      withoutContext.scheduleRecovery(detail || "GSD auto-mode blocked before completing the current unit.", resumeCommand(autoRun.stepMode));
+      return;
+    }
+
+    if (autoRun.active && stop.reason === "error") {
       withoutContext.cancelPending();
       withContext.scheduleRetry("auto_stop_error", detail || "GSD auto-mode stopped with an error before completing the current turn.");
       return;

@@ -2,11 +2,15 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { createContext, createHarness } from "./harness.mjs";
 
-const { setGsdAutoSnapshotReaderForTests } = await import(new URL("../gsd-auto-state.ts", import.meta.url).href);
-
-function withAutoActive(t) {
-  setGsdAutoSnapshotReaderForTests(async () => ({ active: true, paused: false, stepMode: false, basePath: "/repo" }));
-  t.after(() => setGsdAutoSnapshotReaderForTests(undefined));
+async function markAutoActive(harness, overrides = {}) {
+  await harness.handler("unit_start")({
+    type: "unit_start",
+    unitType: "execute-task",
+    unitId: "M001/S01/T01",
+    milestoneId: "M001",
+    cwd: "/repo",
+    ...overrides,
+  });
 }
 
 const REGISTERED_HOOKS = [
@@ -19,6 +23,8 @@ const REGISTERED_HOOKS = [
   "stop",
   "tool_call",
   "tool_execution_end",
+  "unit_end",
+  "unit_start",
 ];
 
 test("registers only the hooks the extension actually uses", async (t) => {
@@ -31,8 +37,8 @@ test("registers only the hooks the extension actually uses", async (t) => {
 });
 
 test("internal hook failures are visible and fail open", async (t) => {
-  withAutoActive(t);
   const harness = await createHarness(t);
+  await markAutoActive(harness);
   const context = createContext();
   const input = {};
   input.self = input;
@@ -44,10 +50,10 @@ test("internal hook failures are visible and fail open", async (t) => {
 });
 
 test("status notifications do not enqueue steering messages or kill tool guards", async (t) => {
-  withAutoActive(t);
   t.mock.method(console, "error", () => {});
 
   const harness = await createHarness(t, { throwSendMessage: true });
+  await markAutoActive(harness);
   const context = createContext();
   const validationError = {
     isError: true,

@@ -2,55 +2,14 @@ import { existsSync, realpathSync } from "node:fs";
 import { delimiter, dirname, join, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 
-export type GsdAutoErrorContext = {
-  message: string;
-  category: string;
-  stopReason?: string;
-  isTransient?: boolean;
-  retryAfterMs?: number;
-};
-
-export type GsdAutoSnapshot = {
-  active: boolean;
-  paused: boolean;
-  stepMode: boolean;
-  basePath: string;
-  errorContext?: GsdAutoErrorContext;
-};
-
-type GsdAutoModule = {
-  getAutoDashboardData?: () => Partial<GsdAutoSnapshot>;
-};
-
-type GsdJournalModule = {
-  queryJournal?: (basePath: string, filters?: { eventType?: string }) => JournalEntry[];
-};
-
 type ContextOverflowModule = {
   isContextOverflow?: (message: unknown, contextWindow?: number) => boolean;
 };
 
-type JournalEntry = {
-  ts?: string;
-  eventType?: string;
-  data?: {
-    status?: string;
-    errorContext?: Partial<GsdAutoErrorContext>;
-  };
-};
-
-type SnapshotReader = () => Promise<GsdAutoSnapshot | undefined>;
 type ContextOverflowDetector = (message: unknown, contextWindow?: number) => boolean;
 
-type GsdInternals = {
-  auto?: GsdAutoModule;
-  journal?: GsdJournalModule;
-  overflow?: ContextOverflowModule;
-};
-
-let overrideReader: SnapshotReader | undefined;
 let overrideContextOverflowDetector: ContextOverflowDetector | undefined;
-let cachedInternals: GsdInternals | undefined;
+let cachedOverflow: ContextOverflowModule | undefined;
 let loadAttempted = false;
 
 const existing = (path: string | undefined) => path && existsSync(path) ? path : undefined;
@@ -114,55 +73,19 @@ const importModule = async <T>(path: string | undefined) => {
   }
 };
 
-const loadInternals = async () => {
-  if (cachedInternals || loadAttempted) return cachedInternals;
+const loadOverflow = async () => {
+  if (cachedOverflow || loadAttempted) return cachedOverflow;
   loadAttempted = true;
 
   for (const autoPath of autoCandidates()) {
-    const auto = await importModule<GsdAutoModule>(autoPath);
-    if (typeof auto?.getAutoDashboardData !== "function") continue;
-
-    cachedInternals = {
-      auto,
-      journal: await importModule<GsdJournalModule>(join(dirname(autoPath), "journal.js")),
-      overflow: await importModule<ContextOverflowModule>(overflowCandidate(autoPath)),
-    };
-    return cachedInternals;
+    const overflow = await importModule<ContextOverflowModule>(overflowCandidate(autoPath));
+    if (typeof overflow?.isContextOverflow !== "function") continue;
+    cachedOverflow = overflow;
+    return cachedOverflow;
   }
 
-  cachedInternals = undefined;
+  cachedOverflow = undefined;
   return undefined;
-};
-
-const normalizeErrorContext = (errorContext: Partial<GsdAutoErrorContext> | undefined) => {
-  if (typeof errorContext?.message !== "string" || typeof errorContext.category !== "string") return undefined;
-
-  return {
-    message: errorContext.message,
-    category: errorContext.category,
-    ...(typeof errorContext.stopReason === "string" ? { stopReason: errorContext.stopReason } : {}),
-    ...(typeof errorContext.isTransient === "boolean" ? { isTransient: errorContext.isTransient } : {}),
-    ...(typeof errorContext.retryAfterMs === "number" ? { retryAfterMs: errorContext.retryAfterMs } : {}),
-  };
-};
-
-const latestErrorContext = (journal: GsdJournalModule | undefined, basePath: string) => {
-  if (!basePath || typeof journal?.queryJournal !== "function") return undefined;
-
-  try {
-    const latestRecoverable = journal
-      .queryJournal(basePath, { eventType: "unit-end" })
-      .reverse()
-      .find((entry) => entry.data?.status === "cancelled" || entry.data?.status === "blocked" || entry.data?.status === "failed");
-
-    return latestRecoverable ? normalizeErrorContext(latestRecoverable.data?.errorContext) : undefined;
-  } catch {
-    return undefined;
-  }
-};
-
-export const setGsdAutoSnapshotReaderForTests = (reader: SnapshotReader | undefined) => {
-  overrideReader = reader;
 };
 
 export const setContextOverflowDetectorForTests = (detector: ContextOverflowDetector | undefined) => {
@@ -179,27 +102,9 @@ export const importInstalledGsdModule = async <T>(relativePath: string) => {
   return undefined;
 };
 
-export const readGsdAutoSnapshot = async () => {
-  if (overrideReader) return overrideReader();
-
-  const internals = await loadInternals();
-  const snapshot = internals?.auto?.getAutoDashboardData?.();
-  if (!snapshot) return undefined;
-
-  const basePath = typeof snapshot.basePath === "string" ? snapshot.basePath : "";
-
-  return {
-    active: snapshot.active === true,
-    paused: snapshot.paused === true,
-    stepMode: snapshot.stepMode === true,
-    basePath,
-    errorContext: latestErrorContext(internals.journal, basePath),
-  };
-};
-
 export const isContextOverflow = async (message: unknown, contextWindow?: number) => {
   if (overrideContextOverflowDetector) return overrideContextOverflowDetector(message, contextWindow);
 
-  const detector = (await loadInternals())?.overflow?.isContextOverflow;
+  const detector = (await loadOverflow())?.isContextOverflow;
   return typeof detector === "function" && detector(message, contextWindow);
 };
