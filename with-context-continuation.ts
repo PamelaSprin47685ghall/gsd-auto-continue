@@ -47,11 +47,24 @@ const resultText = (result: unknown) => {
     .trim();
 };
 
+const semanticFailureTextPattern = /GSD TOOL CALL DID NOT RUN/i;
+
+const resultDetails = (result: unknown) => result && typeof result === "object" ? (result as { details?: unknown }).details : undefined;
+
+const isSemanticFailureResult = (event: ToolExecutionEndLoopEvent) => {
+  const details = resultDetails(event.result);
+  return isGsdToolName(event.toolName) && (
+    (details && typeof details === "object" && (details as { semanticFailure?: unknown }).semanticFailure === true) ||
+    semanticFailureTextPattern.test(resultText(event.result))
+  );
+};
+
+const isGsdToolName = (toolName: unknown) => typeof toolName === "string" && toolName.startsWith("gsd_");
+
 const isPreparationError = (event: ToolExecutionEndLoopEvent) =>
-  typeof event.toolName === "string" &&
-  event.toolName.startsWith("gsd_") &&
-  event.isError === true &&
-  PREPARATION_ERROR_PATTERNS.some((pattern) => pattern.test(resultText(event.result)));
+  isGsdToolName(event.toolName) &&
+  (isSemanticFailureResult(event) ||
+    event.isError === true && PREPARATION_ERROR_PATTERNS.some((pattern) => pattern.test(resultText(event.result))));
 
 const normalize = (value: unknown): unknown => {
   if (Array.isArray(value)) return value.map(normalize);

@@ -8,9 +8,12 @@ type AgentTool = {
   execute: (toolCallId: string, params: unknown, signal?: AbortSignal, onUpdate?: unknown) => Promise<ToolResult>;
   [key: string]: unknown;
 };
+type StreamContext = { tools?: AgentTool[]; [key: string]: unknown };
+type StreamFunction = (model: unknown, context: StreamContext, options?: unknown) => unknown;
 type AgentLike = {
   state?: { tools?: AgentTool[] };
   setTools?: (tools: AgentTool[]) => void;
+  streamFn?: StreamFunction;
 };
 type AgentClass = { prototype: Record<PropertyKey, unknown> };
 type Validator = (tool: AgentTool, toolCall: { id: string; name: string; arguments: unknown }) => unknown;
@@ -27,6 +30,7 @@ type AgentMessageLike = {
 
 const PATCH_MARKER = Symbol.for("gsd-auto-continue.semantic-gsd-validation.patch");
 const TOOL_MARKER = Symbol.for("gsd-auto-continue.semantic-gsd-validation.tool");
+const ORIGINAL_TOOL_MARKER = Symbol.for("gsd-auto-continue.semantic-gsd-validation.original-tool");
 
 const fallbackSchema = { type: "object", additionalProperties: true };
 
@@ -78,6 +82,33 @@ const collectConditionalRequiredIssues = (schema: unknown, value: unknown, path:
       issues.push(`${childPath} must be a non-empty string unless isSketch is true`);
     }
     collectConditionalRequiredIssues(propertySchema, value[key], childPath, issues);
+  }
+};
+
+const normalizeSchemaEncodedValues = (schema: unknown, value: unknown): unknown => {
+  if (!isRecord(schema)) return value;
+
+  if (schema.type === "array") {
+    const arrayValue = typeof value === "string" ? parseJsonArray(value) : value;
+    return Array.isArray(arrayValue) ? arrayValue.map((item) => normalizeSchemaEncodedValues(schema.items, item)) : value;
+  }
+
+  if (isRecord(schema.properties) && isRecord(value)) {
+    return Object.entries(value).reduce<Record<string, unknown>>((normalized, [key, childValue]) => {
+      normalized[key] = normalizeSchemaEncodedValues(schema.properties?.[key], childValue);
+      return normalized;
+    }, {});
+  }
+
+  return value;
+};
+
+const parseJsonArray = (value: string) => {
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed : value;
+  } catch {
+    return value;
   }
 };
 
@@ -150,10 +181,12 @@ export function wrapGsdToolForSemanticValidation(tool: AgentTool, validateToolAr
   return {
     ...tool,
     [TOOL_MARKER]: true,
+    [ORIGINAL_TOOL_MARKER]: tool,
     parameters: semanticParameters(tool.parameters),
     execute: async (toolCallId, params, signal, onUpdate) => {
       try {
-        const validatedParams = await validateToolArguments(tool, { id: toolCallId, name: tool.name, arguments: params });
+        const normalizedParams = normalizeSchemaEncodedValues(tool.parameters, params);
+        const validatedParams = await validateToolArguments(tool, { id: toolCallId, name: tool.name, arguments: normalizedParams });
         validateConditionalRuntimeContract(tool, validatedParams);
         const result = await tool.execute(toolCallId, validatedParams, signal, onUpdate);
         const error = resultError(result);
@@ -164,6 +197,21 @@ export function wrapGsdToolForSemanticValidation(tool: AgentTool, validateToolAr
     },
   };
 }
+
+const originalProviderTool = (tool: AgentTool) => ((tool as Record<PropertyKey, unknown>)[ORIGINAL_TOOL_MARKER] as AgentTool | undefined) ?? tool;
+
+const exposeOriginalProviderSchemas = (tools: AgentTool[] | undefined) => tools?.map(originalProviderTool);
+
+const withOriginalProviderSchemas = (agent: AgentLike, run: () => Promise<unknown>) => {
+  if (typeof agent.streamFn !== "function") return run();
+
+  const originalStreamFn = agent.streamFn;
+  agent.streamFn = ((model, context, options) => originalStreamFn(model, { ...context, tools: exposeOriginalProviderSchemas(context.tools) }, options)) as StreamFunction;
+
+  return run().finally(() => {
+    agent.streamFn = originalStreamFn;
+  });
+};
 
 async function shouldEnableSemanticValidation(agent: AgentLike, options: Required<InstallOptions>, runArgs: unknown[]) {
   return hasGsdAutoMessage(runArgs[0]) || hasGsdAutoMessage(agent.state?.messages) || await options.isEnabled();
@@ -180,7 +228,7 @@ async function withSemanticGsdValidation<T>(agent: AgentLike, options: Required<
 
   setTools(wrappedTools);
   try {
-    return await run();
+    return await withOriginalProviderSchemas(agent, run) as T;
   } finally {
     setTools(tools);
   }

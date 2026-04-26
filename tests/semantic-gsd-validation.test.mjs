@@ -35,6 +35,44 @@ test("semantic GSD wrapper returns a transport-successful semantic failure for i
   assert.doesNotMatch(result.content[0].text, /Received arguments/);
 });
 
+test("semantic GSD wrapper decodes JSON strings for schema array fields before validation", async () => {
+  const tool = {
+    name: "gsd_plan_slice",
+    parameters: {
+      type: "object",
+      required: ["tasks"],
+      properties: {
+        tasks: {
+          type: "array",
+          items: {
+            type: "object",
+            required: ["taskId", "files"],
+            properties: {
+              taskId: { type: "string" },
+              files: { type: "array", items: { type: "string" } },
+            },
+          },
+        },
+      },
+    },
+    execute: async (_toolCallId, params) => ({ content: [{ type: "text", text: `${params.tasks.length}:${params.tasks[0].files.length}` }] }),
+  };
+  const wrapped = wrapGsdToolForSemanticValidation(tool, (_tool, toolCall) => {
+    assert.equal(Array.isArray(toolCall.arguments.tasks), true);
+    assert.equal(Array.isArray(toolCall.arguments.tasks[0].files), true);
+    return toolCall.arguments;
+  });
+
+  const result = await wrapped.execute(
+    "call-1",
+    { tasks: JSON.stringify([{ taskId: "T01", files: JSON.stringify(["src/A.kt"]) }]) },
+    undefined,
+    undefined,
+  );
+
+  assert.equal(result.content[0].text, "1:1");
+});
+
 test("semantic GSD wrapper runs original tool with validated args", async () => {
   const wrapped = wrapGsdToolForSemanticValidation(gsdTool(), () => ({ ok: "validated" }));
 
@@ -190,6 +228,45 @@ test("agent patch wraps gsd tools only during active auto-mode prompt", async ()
   assert.notEqual(agent.promptTools[0], originalGsdTool);
   assert.deepEqual(agent.promptTools[0].parameters.anyOf[0], originalGsdTool.parameters);
   assert.equal(agent.promptTools[1], ordinaryTool);
+  assert.equal(agent.state.tools[0], originalGsdTool);
+});
+
+test("agent patch exposes original schemas to provider while keeping internal semantic wrappers", async () => {
+  class FakeAgent {
+    constructor(tools) {
+      this.state = { tools };
+      this.streamFn = async (_model, context) => {
+        this.providerTools = context.tools;
+      };
+    }
+
+    setTools(tools) {
+      this.state.tools = tools;
+    }
+
+    async prompt() {
+      this.internalTools = this.state.tools;
+      await this.streamFn({}, { tools: this.state.tools }, {});
+    }
+
+    async continue() {}
+  }
+
+  await installSemanticGsdValidationPatch({
+    AgentClass: FakeAgent,
+    validateToolArguments: () => ({ ok: "validated" }),
+    isEnabled: () => true,
+  });
+
+  const originalGsdTool = gsdTool();
+  const agent = new FakeAgent([originalGsdTool]);
+
+  await agent.prompt();
+
+  assert.notEqual(agent.internalTools[0], originalGsdTool);
+  assert.deepEqual(agent.internalTools[0].parameters.anyOf[0], originalGsdTool.parameters);
+  assert.equal(agent.providerTools[0], originalGsdTool);
+  assert.deepEqual(agent.providerTools[0].parameters, originalGsdTool.parameters);
   assert.equal(agent.state.tools[0], originalGsdTool);
 });
 

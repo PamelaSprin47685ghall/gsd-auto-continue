@@ -92,6 +92,44 @@ test("schema-preparation tool results abort before the provider can make a third
   assert.doesNotMatch(context.notifications.at(-1).content, /Manual intervention detected/);
 });
 
+test("semantic GSD failures abort before repeated retry loops continue", async (t) => {
+  withAutoActive(t);
+  const harness = await createHarness(t);
+  const context = createContext();
+  const semanticFailure = {
+    isError: false,
+    result: {
+      content: [{ type: "text", text: "🚨 GSD TOOL CALL DID NOT RUN.\n\nValidation problem:\ntasks: must be array" }],
+      details: { semanticFailure: true, toolName: "gsd_plan_slice", source: "gsd-auto-continue" },
+    },
+  };
+
+  await harness.handler("tool_execution_end")({ type: "tool_execution_end", toolName: "gsd_plan_slice", ...semanticFailure }, context.ctx);
+  assert.equal(context.aborts.length, 0);
+
+  await harness.handler("tool_execution_end")({ type: "tool_execution_end", toolName: "gsd_plan_slice", ...semanticFailure }, context.ctx);
+  assert.equal(context.aborts.length, 1);
+  assert.match(context.notifications.at(-1).content, /schema failures are repeating/);
+});
+
+test("non-auto semantic GSD failures do not trigger recovery", async (t) => {
+  const harness = await createHarness(t);
+  const context = createContext();
+  const semanticFailure = {
+    isError: false,
+    result: {
+      content: [{ type: "text", text: "🚨 GSD TOOL CALL DID NOT RUN.\n\nValidation problem:\ntasks: must be array" }],
+      details: { semanticFailure: true, toolName: "gsd_plan_slice", source: "gsd-auto-continue" },
+    },
+  };
+
+  await harness.handler("tool_execution_end")({ type: "tool_execution_end", toolName: "gsd_plan_slice", ...semanticFailure }, context.ctx);
+  await harness.handler("tool_execution_end")({ type: "tool_execution_end", toolName: "gsd_plan_slice", ...semanticFailure }, context.ctx);
+
+  assert.equal(context.aborts.length, 0);
+  assert.equal(harness.timers.pending().length, 0);
+});
+
 test("non-auto GSD schema-preparation failures do not trigger recovery", async (t) => {
   const harness = await createHarness(t);
   const context = createContext();
