@@ -55,6 +55,20 @@ test("schema-preparation tool results abort before the provider can make a third
   assert.doesNotMatch(harness.systemMessages.at(-1).message.content, /Manual intervention detected/);
 });
 
+test("schema-preparation guard recognizes validation errors after tool-name prefixes", async (t) => {
+  const harness = await createHarness(t);
+  const context = createContext();
+  const prefixedValidationError = validationError('gsd_plan_slice\nValidation failed for tool "gsd_plan_slice":\n  - tasks: must be array');
+
+  await harness.handler("tool_result")({ type: "tool_result", toolName: "gsd_plan_slice", ...prefixedValidationError }, context.ctx);
+  assert.equal(context.aborts.length, 0);
+
+  await harness.handler("tool_result")({ type: "tool_result", toolName: "gsd_plan_slice", ...prefixedValidationError }, context.ctx);
+
+  assert.equal(context.aborts.length, 1);
+  assert.match(harness.systemMessages.at(-1).message.content, /schema failures are repeating/);
+});
+
 test("ordinary tool execution errors do not count toward the schema guard", async (t) => {
   const harness = await createHarness(t);
   const context = createContext();

@@ -26,10 +26,10 @@ type ArmedAbort = {
 };
 
 const PREPARATION_ERROR_PATTERNS = [
-  /^Validation failed for tool\b/i,
-  /^Tool .+ not found$/i,
-  /^Tool execution was blocked$/i,
-  /^Tool loop detected:/i,
+  /\bValidation failed for tool\b/i,
+  /\bTool .+ not found\b/i,
+  /\bTool execution was blocked\b/i,
+  /\bTool loop detected:/i,
   /Blocking to prevent infinite loop/i,
 ];
 
