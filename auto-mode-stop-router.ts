@@ -62,10 +62,23 @@ export function registerAutoModeStopRouter(pi: ExtensionAPI) {
     }
   };
 
+  const sendFollowUp = (content: string) => {
+    sendSystem("↪️ [AutoContinue] Queueing recovery follow-up before abort.");
+
+    try {
+      pi.sendUserMessage(content, { deliverAs: "followUp" });
+      return true;
+    } catch (error) {
+      sendSystem(`❌ [AutoContinue] Failed to queue recovery follow-up visibly: ${errorText(error)}.`, "error");
+      return false;
+    }
+  };
+
   const withoutContext = createWithoutContextRecovery({ sendSystem, sendUserMessage });
   const withContext = createWithContextContinuation({
     sendSystem,
     sendUserMessage,
+    sendFollowUp,
     isWithoutContextRecoveryRunning: () => withoutContext.recovering,
   });
 
@@ -93,10 +106,12 @@ export function registerAutoModeStopRouter(pi: ExtensionAPI) {
   const resumeCommand = (stepMode: boolean) => (stepMode ? "/gsd next" : CONTINUATION_POLICY.resumeCommand);
   const recoverableGsdPause = (reason: StopEvent["reason"], errorContext: unknown) => reason !== "cancelled" || errorContext !== undefined;
 
-  const isGsdPaused = async () => {
-    const snapshot = await readGsdAutoSnapshot();
-    return snapshot?.paused === true && snapshot.active === false ? snapshot : undefined;
-  };
+  const isGsdPaused = (snapshot: Awaited<ReturnType<typeof readGsdAutoSnapshot>>) =>
+    snapshot?.paused === true && snapshot.active === false ? snapshot : undefined;
+
+  const isRecoverableGsdStop = (snapshot: Awaited<ReturnType<typeof readGsdAutoSnapshot>>) =>
+    snapshot?.active === false &&
+    (snapshot.errorContext?.category === "session-failed" || snapshot.errorContext?.category === "timeout");
 
   const onSafe = (eventName: string, handler: (event: unknown, ctx?: ExtensionContext) => unknown) => {
     pi.on(eventName as never, async (event: unknown, ctx?: ExtensionContext) => {
@@ -171,12 +186,22 @@ export function registerAutoModeStopRouter(pi: ExtensionAPI) {
 
     if (withContext.handleProgrammaticAbort()) return;
 
-    const pausedAuto = await isGsdPaused();
+    const gsdSnapshot = await readGsdAutoSnapshot();
+    const pausedAuto = isGsdPaused(gsdSnapshot);
     if (pausedAuto && recoverableGsdPause(stop.reason, pausedAuto.errorContext)) {
       withContext.standDown();
       withoutContext.scheduleRecovery(
         pausedAuto.errorContext ? `${pausedAuto.errorContext.category}: ${pausedAuto.errorContext.message}` : detail || String(stop.reason),
         resumeCommand(pausedAuto.stepMode),
+      );
+      return;
+    }
+
+    if (isRecoverableGsdStop(gsdSnapshot)) {
+      withContext.standDown();
+      withoutContext.scheduleRecovery(
+        `${gsdSnapshot.errorContext!.category}: ${gsdSnapshot.errorContext!.message}`,
+        resumeCommand(gsdSnapshot.stepMode),
       );
       return;
     }

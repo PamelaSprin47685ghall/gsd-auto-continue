@@ -38,20 +38,22 @@ test("schema-preparation tool results abort before the provider can make a third
 
   await harness.handler("tool_execution_end")({ type: "tool_execution_end", toolName: "gsd_plan_slice", ...validationError() }, context.ctx);
   assert.equal(context.aborts.length, 1);
-  assert.match(harness.systemMessages.at(-1).message.content, /schema failures are repeating/);
+  assert.match(harness.systemMessages.at(-2).message.content, /schema failures are repeating/);
+  assert.equal(harness.userMessageCalls.at(-1).options?.deliverAs, "followUp");
+  assert.match(harness.userMessages.at(-1), /Two consecutive tool calls failed before execution/);
 
   await stop(harness, "error", "Operation aborted");
-  await harness.timers.flushNext();
 
-  assert.match(harness.userMessages.at(-1), /Two consecutive tool calls failed before execution/);
-  assert.notEqual(harness.userMessages.at(-1).trim(), "/gsd auto");
+  assert.equal(harness.timers.pending().length, 0);
+  assert.equal(harness.userMessages.length, 1);
   assert.doesNotMatch(harness.systemMessages.at(-1).message.content, /Manual intervention detected/);
 });
 
-test("single tool validation failure followed by stop does not trigger recovery", async (t) => {
+test("ordinary tool validation failures do not trigger recovery", async (t) => {
   const harness = await createHarness(t);
   const context = createContext();
 
+  await harness.handler("tool_execution_end")({ type: "tool_execution_end", toolName: "lsp", ...validationError('Validation failed for tool "lsp": missing action') }, context.ctx);
   await harness.handler("tool_execution_end")({ type: "tool_execution_end", toolName: "lsp", ...validationError('Validation failed for tool "lsp": missing action') }, context.ctx);
   await stop(harness, "error", "Operation aborted");
 
@@ -71,7 +73,7 @@ test("schema-preparation guard recognizes validation errors after tool-name pref
   await harness.handler("tool_execution_end")({ type: "tool_execution_end", toolName: "gsd_plan_slice", ...prefixedValidationError }, context.ctx);
 
   assert.equal(context.aborts.length, 1);
-  assert.match(harness.systemMessages.at(-1).message.content, /schema failures are repeating/);
+  assert.match(harness.systemMessages.at(-2).message.content, /schema failures are repeating/);
 });
 
 test("ordinary tool execution errors do not count toward the schema guard", async (t) => {
@@ -137,10 +139,11 @@ test("identical tool calls abort on the fourth call before GSD blocks the fifth"
   assert.match(result.reason, /called 4 consecutive times/);
 
   await stop(harness, "error", "Operation aborted");
-  await harness.timers.flushNext();
 
+  assert.equal(harness.timers.pending().length, 0);
   assert.match(harness.userMessages.at(-1), /identical_tool_call_guard/);
   assert.match(harness.userMessages.at(-1), /called 4 consecutive times/);
+  assert.equal(harness.userMessageCalls.at(-1).options?.deliverAs, "followUp");
   assert.doesNotMatch(harness.systemMessages.at(-1).message.content, /Manual intervention detected/);
 });
 
@@ -192,7 +195,7 @@ test("manual intervention rule matching uses simple and-or conditions", () => {
   assert.equal(matchesManualIntervention("Queued background job completed"), false);
 });
 
-async function armSchemaRetry(harness, context = createContext()) {
+async function armFallbackSchemaRetry(harness, context = createContext()) {
   await harness.handler("tool_execution_end")({ type: "tool_execution_end", toolName: "gsd_plan_slice", ...validationError() }, context.ctx);
   await harness.handler("tool_execution_end")({ type: "tool_execution_end", toolName: "gsd_plan_slice", ...validationError() }, context.ctx);
   await stop(harness, "error", "Operation aborted");
@@ -211,9 +214,9 @@ test("provider errors do not count as manual intervention", async (t) => {
   assert.equal(harness.systemMessages.length, 0);
 });
 
-test("manual intervention cancels pending with-context retry", async (t) => {
-  const harness = await createHarness(t);
-  await armSchemaRetry(harness);
+test("manual intervention cancels pending fallback retry", async (t) => {
+  const harness = await createHarness(t, { throwSendUserMessage: true });
+  await armFallbackSchemaRetry(harness);
 
   await notify(harness, "manual intervention requested by operator", "input_needed");
   await stop(harness, "error", "manual intervention requested by operator");
@@ -222,9 +225,9 @@ test("manual intervention cancels pending with-context retry", async (t) => {
   assert.match(harness.systemMessages.at(-1).message.content, /Manual intervention detected/);
 });
 
-test("manual operation abort cancels pending with-context retry when it was not self-triggered", async (t) => {
-  const harness = await createHarness(t);
-  await armSchemaRetry(harness);
+test("manual operation abort cancels pending fallback retry when it was not self-triggered", async (t) => {
+  const harness = await createHarness(t, { throwSendUserMessage: true });
+  await armFallbackSchemaRetry(harness);
 
   await stop(harness, "error", "Operation aborted");
 
@@ -232,7 +235,7 @@ test("manual operation abort cancels pending with-context retry when it was not 
   assert.match(harness.systemMessages.at(-1).message.content, /Manual intervention detected/);
 });
 
-test("official stop and review notifications cancel pending with-context retry", async (t) => {
+test("official stop and review notifications cancel pending fallback retry", async (t) => {
   for (const message of [
     "Stop directive: stop after this task",
     "Backtrack directive: undo the last milestone",
@@ -242,8 +245,8 @@ test("official stop and review notifications cancel pending with-context retry",
     "Provider requires human input before continuing.",
     "Recovery stopped because operator action is required.",
   ]) {
-    const harness = await createHarness(t);
-    await armSchemaRetry(harness);
+    const harness = await createHarness(t, { throwSendUserMessage: true });
+    await armFallbackSchemaRetry(harness);
 
     await notify(harness, message, "warning");
     await stop(harness, "blocked", "operator review required");

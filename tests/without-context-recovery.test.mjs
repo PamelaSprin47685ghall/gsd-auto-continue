@@ -45,6 +45,25 @@ test("GSD paused step mode resumes with /gsd next", async (t) => {
   assert.equal(harness.userMessages.at(-1), "/gsd next");
 });
 
+test("GSD stopped with structured session-failed context uses without-context recovery", async (t) => {
+  withGsdSnapshot(t, {
+    active: false,
+    paused: false,
+    stepMode: false,
+    basePath: "/repo",
+    errorContext: { category: "session-failed", message: "Session creation failed: unknown", isTransient: true },
+  });
+  const harness = await createHarness(t);
+
+  await stop(harness, "cancelled", "Operation aborted");
+
+  assert.equal(harness.timers.pending().length, 1);
+  assert.match(harness.systemMessages.at(-1).message.content, /without-context recovery loop 1/);
+
+  await harness.timers.flushNext();
+  assert.match(harness.userMessages.at(-1), /session-failed: Session creation failed: unknown/);
+});
+
 test("cancelled GSD pause with structured error context recovers", async (t) => {
   withGsdSnapshot(t, {
     active: false,

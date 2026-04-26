@@ -10,6 +10,7 @@ export type ToolCallLoopEvent = {
 };
 
 export type ToolExecutionEndLoopEvent = {
+  toolName?: unknown;
   isError?: boolean;
   result?: unknown;
 };
@@ -17,12 +18,14 @@ export type ToolExecutionEndLoopEvent = {
 type WithContextContinuationOptions = {
   sendSystem(content: string): void;
   sendUserMessage(content: string): void;
+  sendFollowUp(content: string): boolean;
   isWithoutContextRecoveryRunning(): boolean;
 };
 
 type ArmedAbort = {
   reason: string;
   detail: string;
+  followUpQueued: boolean;
 };
 
 const PREPARATION_ERROR_PATTERNS = [
@@ -47,7 +50,10 @@ const resultText = (result: unknown) => {
 };
 
 const isPreparationError = (event: ToolExecutionEndLoopEvent) =>
-  event.isError === true && PREPARATION_ERROR_PATTERNS.some((pattern) => pattern.test(resultText(event.result)));
+  typeof event.toolName === "string" &&
+  event.toolName.startsWith("gsd_") &&
+  event.isError === true &&
+  PREPARATION_ERROR_PATTERNS.some((pattern) => pattern.test(resultText(event.result)));
 
 const normalize = (value: unknown): unknown => {
   if (Array.isArray(value)) return value.map(normalize);
@@ -68,9 +74,13 @@ const toolCallSignature = (toolName: string, input: unknown) => {
   return hash.digest("hex").slice(0, 16);
 };
 
+const retryPrompt = (reason: string, detail: string) =>
+  `Continue from the current context. The previous turn failed (${reason}):\n\n${detail}\n\nRetry only the failed operation. If tool arguments were invalid, regenerate valid arguments. Do not restart /gsd auto.`;
+
 export function createWithContextContinuation({
   sendSystem,
   sendUserMessage,
+  sendFollowUp,
   isWithoutContextRecoveryRunning,
 }: WithContextContinuationOptions) {
   let attempts = 0;
@@ -125,17 +135,18 @@ export function createWithContextContinuation({
 
     timer = setTimeout(() => {
       timer = null;
-      sendUserMessage(
-        `Continue from the current context. The previous turn failed (${reason}):\n\n${detail}\n\nRetry only the failed operation. If tool arguments were invalid, regenerate valid arguments. Do not restart /gsd auto.`,
-      );
+      sendUserMessage(retryPrompt(reason, detail));
     }, delayMs);
   };
 
-  const abortForRetry = (ctx: ExtensionContext, systemMessage: string, abort: ArmedAbort) => {
+  const abortForRetry = (ctx: ExtensionContext, systemMessage: string, abort: Omit<ArmedAbort, "followUpQueued">) => {
     if (armedAbort) return { block: true, reason: abort.detail };
 
-    armedAbort = abort;
     sendSystem(systemMessage);
+    armedAbort = {
+      ...abort,
+      followUpQueued: sendFollowUp(retryPrompt(abort.reason, abort.detail)),
+    };
 
     try {
       ctx.abort();
@@ -179,7 +190,7 @@ export function createWithContextContinuation({
 
       return abortForRetry(
         ctx,
-        `⚠️ [AutoContinue] ${event.toolName} is repeating identical arguments. Aborting before GSD's loop guard blocks the next call.`,
+        `⚠️ [AutoContinue] ${event.toolName} is repeating identical arguments. Queueing recovery before aborting this turn.`,
         {
           reason: "identical_tool_call_guard",
           detail: `${event.toolName} was called ${identicalToolCallCount} consecutive times with identical arguments; retry with a different approach before GSD's fifth-call loop guard fires.`,
@@ -200,7 +211,7 @@ export function createWithContextContinuation({
 
       if (consecutivePreparationToolResults < CONTINUATION_POLICY.maxPreparationErrorTurnsBeforeAbort) return;
 
-      abortForRetry(ctx, "⚠️ [AutoContinue] Tool-call schema failures are repeating. Aborting before the provider can issue a third invalid call.", {
+      abortForRetry(ctx, "⚠️ [AutoContinue] Tool-call schema failures are repeating. Queueing recovery before aborting this turn.", {
         reason: "tool_schema_guard",
         detail:
           "Two consecutive tool calls failed before execution; retry with corrected tool arguments before Pi's three-turn schema-overload interrupt fires.",
@@ -212,6 +223,11 @@ export function createWithContextContinuation({
 
       const abort = armedAbort;
       resetRecoveryGuards();
+      if (abort.followUpQueued) {
+        sendSystem("✅ [AutoContinue] Recovery follow-up was already queued before abort; not dispatching a duplicate retry.");
+        return true;
+      }
+
       scheduleRetry(abort.reason, abort.detail);
       return true;
     },

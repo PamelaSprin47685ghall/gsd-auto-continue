@@ -46,6 +46,8 @@ function createPi({ throwSendMessage = false, throwSendUserMessage = false } = {
   const userMessages = [];
   const triggerTurns = [];
 
+  const userMessageCalls = [];
+
   const pi = {
     on(eventName, handler) {
       handlers.set(eventName, handler);
@@ -55,8 +57,9 @@ function createPi({ throwSendMessage = false, throwSendUserMessage = false } = {
       systemMessages.push({ message, options });
       if (options?.triggerTurn) triggerTurns.push({ message, options });
     },
-    sendUserMessage(content) {
+    sendUserMessage(content, options) {
       userMessages.push(content);
+      userMessageCalls.push({ content, options });
       if (throwSendUserMessage) throw new Error("synthetic send failure");
     },
   };
@@ -66,6 +69,7 @@ function createPi({ throwSendMessage = false, throwSendUserMessage = false } = {
     handlers,
     systemMessages,
     userMessages,
+    userMessageCalls,
     triggerTurns,
     handler(eventName) {
       const handler = handlers.get(eventName);
