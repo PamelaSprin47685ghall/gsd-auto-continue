@@ -98,7 +98,7 @@ export function registerAutoModeStopRouter(pi: ExtensionAPI) {
 
   const isRecoverableGsdStop = (snapshot: Awaited<ReturnType<typeof readGsdAutoSnapshot>>) =>
     snapshot?.active === false &&
-    (snapshot.errorContext?.category === "session-failed" || snapshot.errorContext?.category === "timeout");
+    (snapshot.errorContext?.category === "session-failed" || snapshot.errorContext?.category === "timeout" || snapshot.errorContext?.category === "pre-execution");
 
   const onSafe = (eventName: string, handler: (event: unknown, ctx?: ExtensionContext) => unknown) => {
     pi.on(eventName as never, async (event: unknown, ctx?: ExtensionContext) => {
@@ -195,7 +195,7 @@ export function registerAutoModeStopRouter(pi: ExtensionAPI) {
 
     if (withContext.handleProgrammaticAbort()) return;
 
-    if (await isContextOverflow(stop.lastMessage, lastContext?.getContextUsage()?.contextWindow)) {
+    if (stop.lastMessage && await isContextOverflow(stop.lastMessage, lastContext?.getContextUsage()?.contextWindow)) {
       withContext.standDown();
 
       if (!overflowDelegatedToCore) {
@@ -223,6 +223,12 @@ export function registerAutoModeStopRouter(pi: ExtensionAPI) {
 
     if (stop.reason === "cancelled") {
       standDown(true);
+      return;
+    }
+
+    if (gsdSnapshot?.active === true && stop.reason === "blocked") {
+      withContext.standDown();
+      withoutContext.scheduleRecovery(detail || "GSD auto-mode blocked before completing the current unit.", resumeCommand(gsdSnapshot.stepMode));
       return;
     }
 

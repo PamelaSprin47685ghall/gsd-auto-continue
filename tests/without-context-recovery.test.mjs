@@ -96,6 +96,25 @@ test("GSD session-failed recovery outranks programmatic abort fallback", async (
   assert.doesNotMatch(harness.userMessages.at(-1), /tool_schema_guard/);
 });
 
+test("GSD blocked journal context uses without-context recovery", async (t) => {
+  withGsdSnapshot(t, {
+    active: false,
+    paused: false,
+    stepMode: false,
+    basePath: "/repo",
+    errorContext: { category: "pre-execution", message: "Task T04 references missing perf-metrics.json" },
+  });
+  const harness = await createHarness(t);
+  const context = createContext();
+
+  await stop(harness, "blocked", "", context.ctx);
+
+  assert.equal(harness.timers.pending().length, 1);
+  assert.match(context.notifications.at(-1).content, /without-context recovery loop 1/);
+  await harness.timers.flushNext();
+  assert.match(harness.userMessages.at(-1), /pre-execution: Task T04 references missing perf-metrics\.json/);
+});
+
 test("cancelled GSD pause with structured error context recovers", async (t) => {
   withGsdSnapshot(t, {
     active: false,

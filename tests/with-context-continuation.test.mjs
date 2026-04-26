@@ -35,6 +35,26 @@ test("ordinary stop errors do not trigger recovery", async (t) => {
   assert.equal(harness.systemMessages.length, 0);
 });
 
+test("active auto-mode blocked stops start without-context recovery", async (t) => {
+  withAutoActive(t);
+  const harness = await createHarness(t);
+  const context = createContext();
+
+  await notify(
+    harness,
+    "Pre-execution checks failed: 1 blocking issue found\nTask T04 references 'spt-application/build/perf-metrics.json' which doesn't exist.",
+    "blocked",
+  );
+  await stop(harness, "blocked", "", context.ctx);
+
+  assert.equal(harness.timers.pending().length, 1);
+  assert.match(context.notifications.at(-1).content, /without-context recovery loop 1/);
+
+  await harness.timers.flushNext();
+  assert.match(harness.userMessages.at(-1), /Pre-execution checks failed/);
+  assert.match(harness.userMessages.at(-1), /perf-metrics\.json/);
+});
+
 test("active auto-mode stop errors retry with current context", async (t) => {
   withAutoActive(t);
   const harness = await createHarness(t);

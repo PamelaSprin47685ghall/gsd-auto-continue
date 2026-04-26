@@ -150,12 +150,12 @@ const latestErrorContext = (journal: GsdJournalModule | undefined, basePath: str
   if (!basePath || typeof journal?.queryJournal !== "function") return undefined;
 
   try {
-    const latestCancelled = journal
+    const latestRecoverable = journal
       .queryJournal(basePath, { eventType: "unit-end" })
       .reverse()
-      .find((entry) => entry.data?.status === "cancelled");
+      .find((entry) => entry.data?.status === "cancelled" || entry.data?.status === "blocked" || entry.data?.status === "failed");
 
-    return latestCancelled ? normalizeErrorContext(latestCancelled.data?.errorContext) : undefined;
+    return latestRecoverable ? normalizeErrorContext(latestRecoverable.data?.errorContext) : undefined;
   } catch {
     return undefined;
   }
