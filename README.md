@@ -7,6 +7,7 @@ Small Pi/GSD extension that keeps `auto-mode` moving after recoverable stops.
 - Ordinary failures schedule a with-context retry in the current conversation.
 - Official auto-mode pause banners (`auto-mode paused`, `step-mode paused`, `paused (escape)`) start without-context recovery.
 - After without-context recovery completes, the extension sends `/gsd auto` to resume automation.
+- Recovery dispatches emit visible status before posting follow-up prompts; internal hook failures are surfaced instead of being left as silent core logs.
 - Repeated schema/preparation tool-call failures are aborted after two consecutive preparation-error tool results, before the provider can issue a third invalid call and trigger Pi core's schema-overload interrupt.
 - Repeated identical tool calls are aborted on the fourth identical call, one call before GSD's fifth-call loop guard blocks execution.
 - Manual/operator intervention cancels pending recovery; self-triggered `ctx.abort()` stops are consumed by the retry guard instead of being treated as manual intervention.

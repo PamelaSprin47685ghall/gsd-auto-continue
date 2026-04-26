@@ -40,7 +40,7 @@ function createFakeTimers() {
   };
 }
 
-function createPi({ throwSendUserMessage = false } = {}) {
+function createPi({ throwSendMessage = false, throwSendUserMessage = false } = {}) {
   const handlers = new Map();
   const systemMessages = [];
   const userMessages = [];
@@ -51,6 +51,7 @@ function createPi({ throwSendUserMessage = false } = {}) {
       handlers.set(eventName, handler);
     },
     sendMessage(message, options) {
+      if (throwSendMessage) throw new Error("synthetic sendMessage failure");
       systemMessages.push({ message, options });
       if (options?.triggerTurn) triggerTurns.push({ message, options });
     },
@@ -76,11 +77,18 @@ function createPi({ throwSendUserMessage = false } = {}) {
 
 export function createContext() {
   const aborts = [];
+  const notifications = [];
   return {
     aborts,
+    notifications,
     ctx: {
       abort() {
         aborts.push({});
+      },
+      ui: {
+        notify(content, type) {
+          notifications.push({ content, type });
+        },
       },
     },
   };
