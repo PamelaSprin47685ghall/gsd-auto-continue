@@ -1,10 +1,11 @@
 import { importInstalledGsdModule, readGsdAutoSnapshot } from "./gsd-auto-state.ts";
 
 type ToolContent = { type: "text"; text: string };
+type ToolResult = { content: ToolContent[]; details?: unknown };
 type AgentTool = {
   name: string;
   parameters?: unknown;
-  execute: (toolCallId: string, params: unknown, signal?: AbortSignal, onUpdate?: unknown) => Promise<{ content: ToolContent[]; details?: unknown }>;
+  execute: (toolCallId: string, params: unknown, signal?: AbortSignal, onUpdate?: unknown) => Promise<ToolResult>;
   [key: string]: unknown;
 };
 type AgentLike = {
@@ -32,6 +33,8 @@ const fallbackSchema = { type: "object", additionalProperties: true };
 const isGsdTool = (tool: AgentTool) => /^gsd_/.test(tool.name);
 const isGsdAutoMessage = (message: unknown) => typeof message === "object" && message !== null && (message as AgentMessageLike).customType === "gsd-auto";
 const hasGsdAutoMessage = (value: unknown): boolean => Array.isArray(value) ? value.some(hasGsdAutoMessage) : isGsdAutoMessage(value);
+const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null;
+const isNonEmptyString = (value: unknown) => typeof value === "string" && value.trim().length > 0;
 
 const semanticParameters = (parameters: unknown) => ({
   anyOf: [parameters ?? fallbackSchema, fallbackSchema],
@@ -42,6 +45,70 @@ const validationSummary = (error: unknown) => {
   const text = error instanceof Error ? error.message : String(error);
   return text.split("\n\nReceived arguments:")[0].trim();
 };
+
+const resultText = (result: ToolResult) => result.content.map((item) => item.text).filter(Boolean).join("\n").trim();
+
+const resultError = (result: ToolResult) => {
+  const details = isRecord(result.details) ? result.details : {};
+  const error = details.error;
+  const text = resultText(result);
+  if (typeof error === "string" && error.trim()) return error.trim();
+  if (/^Error\b/i.test(text) || /\bvalidation failed:/i.test(text)) return text;
+  return undefined;
+};
+
+const schemaDescription = (schema: unknown) => isRecord(schema) && typeof schema.description === "string" ? schema.description : "";
+
+const pathSegment = (base: string, segment: string) => base ? `${base}.${segment}` : segment;
+
+const collectConditionalRequiredIssues = (schema: unknown, value: unknown, path: string, issues: string[]) => {
+  if (!isRecord(schema)) return;
+
+  if (schema.type === "array" && Array.isArray(value)) {
+    value.forEach((item, index) => collectConditionalRequiredIssues(schema.items, item, `${path}[${index}]`, issues));
+    return;
+  }
+
+  if (!isRecord(schema.properties) || !isRecord(value)) return;
+
+  for (const [key, propertySchema] of Object.entries(schema.properties)) {
+    const childPath = pathSegment(path, key);
+    const description = schemaDescription(propertySchema);
+    if (/required for full slices/i.test(description) && value.isSketch !== true && !isNonEmptyString(value[key])) {
+      issues.push(`${childPath} must be a non-empty string unless isSketch is true`);
+    }
+    collectConditionalRequiredIssues(propertySchema, value[key], childPath, issues);
+  }
+};
+
+const validateConditionalRuntimeContract = (tool: AgentTool, params: unknown) => {
+  const issues: string[] = [];
+  collectConditionalRequiredIssues(tool.parameters, params, "", issues);
+  if (issues.length > 0) {
+    throw new Error(`Validation failed for tool "${tool.name}":\n${issues.map((issue) => `  - ${issue}`).join("\n")}`);
+  }
+};
+
+const gsdOperationFailure = (toolName: string, problem: string) => ({
+  content: [
+    {
+      type: "text" as const,
+      text: `🚨 GSD TOOL CALL DID NOT RUN.
+
+The previous ${toolName} call reached the GSD tool but the GSD operation rejected the payload. This is a semantic failure result, not a successful GSD operation.
+
+Validation problem:
+${problem.trim()}
+
+Retry ${toolName} now with a complete, valid payload. Do not treat the prior tool result as a completed GSD operation.`,
+    },
+  ],
+  details: {
+    semanticFailure: true,
+    toolName,
+    source: "gsd-auto-continue",
+  },
+});
 
 const semanticFailure = (toolName: string, error: unknown) => ({
   content: [
@@ -87,7 +154,10 @@ export function wrapGsdToolForSemanticValidation(tool: AgentTool, validateToolAr
     execute: async (toolCallId, params, signal, onUpdate) => {
       try {
         const validatedParams = await validateToolArguments(tool, { id: toolCallId, name: tool.name, arguments: params });
-        return tool.execute(toolCallId, validatedParams, signal, onUpdate);
+        validateConditionalRuntimeContract(tool, validatedParams);
+        const result = await tool.execute(toolCallId, validatedParams, signal, onUpdate);
+        const error = resultError(result);
+        return error ? gsdOperationFailure(tool.name, error) : result;
       } catch (error) {
         return semanticFailure(tool.name, error);
       }

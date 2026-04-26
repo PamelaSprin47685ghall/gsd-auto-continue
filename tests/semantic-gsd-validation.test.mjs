@@ -70,6 +70,94 @@ test("semantic GSD wrapper follows the current runtime schema without hardcoded 
   assert.equal(passed.content[0].text, "ran current-schema");
 });
 
+test("semantic GSD wrapper validates schema-described full-slice fields before execution", async () => {
+  let executed = false;
+  const tool = {
+    name: "gsd_plan_milestone",
+    parameters: {
+      type: "object",
+      required: ["slices"],
+      properties: {
+        slices: {
+          type: "array",
+          items: {
+            type: "object",
+            required: ["sliceId"],
+            properties: {
+              sliceId: { type: "string" },
+              isSketch: { type: "boolean" },
+              successCriteria: { type: "string", description: "Slice success criteria block (required for full slices; omit for sketches)" },
+              proofLevel: { type: "string", description: "Slice proof level (required for full slices; omit for sketches)" },
+              integrationClosure: { type: "string", description: "Slice integration closure (required for full slices; omit for sketches)" },
+              observabilityImpact: { type: "string", description: "Slice observability impact (required for full slices; omit for sketches)" },
+            },
+          },
+        },
+      },
+    },
+    execute: async () => {
+      executed = true;
+      return { content: [{ type: "text", text: "planned" }] };
+    },
+  };
+  const wrapped = wrapGsdToolForSemanticValidation(tool, (_tool, toolCall) => toolCall.arguments);
+
+  const result = await wrapped.execute("call-1", { slices: [{ sliceId: "S01" }] }, undefined, undefined);
+
+  assert.equal(executed, false);
+  assert.equal(result.details.semanticFailure, true);
+  assert.match(result.content[0].text, /slices\[0\]\.successCriteria/);
+  assert.match(result.content[0].text, /slices\[0\]\.proofLevel/);
+  assert.match(result.content[0].text, /slices\[0\]\.integrationClosure/);
+  assert.match(result.content[0].text, /slices\[0\]\.observabilityImpact/);
+});
+
+test("semantic GSD wrapper allows schema-described fields to be omitted for sketch slices", async () => {
+  let executed = false;
+  const tool = {
+    name: "gsd_plan_milestone",
+    parameters: {
+      type: "object",
+      properties: {
+        slices: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              isSketch: { type: "boolean" },
+              successCriteria: { type: "string", description: "Slice success criteria block (required for full slices; omit for sketches)" },
+            },
+          },
+        },
+      },
+    },
+    execute: async () => {
+      executed = true;
+      return { content: [{ type: "text", text: "planned" }] };
+    },
+  };
+  const wrapped = wrapGsdToolForSemanticValidation(tool, (_tool, toolCall) => toolCall.arguments);
+
+  const result = await wrapped.execute("call-1", { slices: [{ isSketch: true }] }, undefined, undefined);
+
+  assert.equal(executed, true);
+  assert.equal(result.content[0].text, "planned");
+});
+
+test("semantic GSD wrapper normalizes GSD operation validation failures", async () => {
+  const wrapped = wrapGsdToolForSemanticValidation(gsdTool(async () => ({
+    content: [{ type: "text", text: "Error planning milestone: validation failed: slices[0].proofLevel must be a non-empty string" }],
+    details: { operation: "plan_milestone", error: "validation failed: slices[0].proofLevel must be a non-empty string" },
+  })), () => ({ ok: "valid" }));
+
+  const result = await wrapped.execute("call-1", { ok: "raw" }, undefined, undefined);
+
+  assert.equal(result.details.semanticFailure, true);
+  assert.match(result.content[0].text, /GSD TOOL CALL DID NOT RUN/);
+  assert.match(result.content[0].text, /slices\[0\]\.proofLevel/);
+  assert.doesNotMatch(result.content[0].text, /^Error planning milestone/);
+});
+
 test("agent patch wraps gsd tools only during active auto-mode prompt", async () => {
   class FakeAgent {
     constructor(tools) {
