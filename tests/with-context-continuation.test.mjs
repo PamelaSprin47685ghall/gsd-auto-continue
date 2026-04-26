@@ -6,17 +6,17 @@ const { matchesManualIntervention } = await import(new URL("../continuation-poli
 
 const validationError = (text = "Validation failed for tool \"write\": missing required property") => ({
   isError: true,
-  content: [{ type: "text", text }],
+  result: { content: [{ type: "text", text }] },
 });
 
 const executionError = (text = "Command exited with code 1") => ({
   isError: true,
-  content: [{ type: "text", text }],
+  result: { content: [{ type: "text", text }] },
 });
 
 const success = () => ({
   isError: false,
-  content: [{ type: "text", text: "ok" }],
+  result: { content: [{ type: "text", text: "ok" }] },
 });
 
 test("ordinary failures retry in the current context and do not restart auto-mode", async (t) => {
@@ -40,10 +40,10 @@ test("schema-preparation tool results abort before the provider can make a third
   const harness = await createHarness(t);
   const context = createContext();
 
-  await harness.handler("tool_result")({ type: "tool_result", toolName: "gsd_plan_slice", ...validationError() }, context.ctx);
+  await harness.handler("tool_execution_end")({ type: "tool_execution_end", toolName: "gsd_plan_slice", ...validationError() }, context.ctx);
   assert.equal(context.aborts.length, 0);
 
-  await harness.handler("tool_result")({ type: "tool_result", toolName: "gsd_plan_slice", ...validationError() }, context.ctx);
+  await harness.handler("tool_execution_end")({ type: "tool_execution_end", toolName: "gsd_plan_slice", ...validationError() }, context.ctx);
   assert.equal(context.aborts.length, 1);
   assert.match(harness.systemMessages.at(-1).message.content, /schema failures are repeating/);
 
@@ -60,10 +60,10 @@ test("schema-preparation guard recognizes validation errors after tool-name pref
   const context = createContext();
   const prefixedValidationError = validationError('gsd_plan_slice\nValidation failed for tool "gsd_plan_slice":\n  - tasks: must be array');
 
-  await harness.handler("tool_result")({ type: "tool_result", toolName: "gsd_plan_slice", ...prefixedValidationError }, context.ctx);
+  await harness.handler("tool_execution_end")({ type: "tool_execution_end", toolName: "gsd_plan_slice", ...prefixedValidationError }, context.ctx);
   assert.equal(context.aborts.length, 0);
 
-  await harness.handler("tool_result")({ type: "tool_result", toolName: "gsd_plan_slice", ...prefixedValidationError }, context.ctx);
+  await harness.handler("tool_execution_end")({ type: "tool_execution_end", toolName: "gsd_plan_slice", ...prefixedValidationError }, context.ctx);
 
   assert.equal(context.aborts.length, 1);
   assert.match(harness.systemMessages.at(-1).message.content, /schema failures are repeating/);
@@ -73,9 +73,9 @@ test("ordinary tool execution errors do not count toward the schema guard", asyn
   const harness = await createHarness(t);
   const context = createContext();
 
-  await harness.handler("tool_result")({ type: "tool_result", toolName: "bash", ...executionError() }, context.ctx);
-  await harness.handler("tool_result")({ type: "tool_result", toolName: "bash", ...executionError() }, context.ctx);
-  await harness.handler("tool_result")({ type: "tool_result", toolName: "bash", ...executionError() }, context.ctx);
+  await harness.handler("tool_execution_end")({ type: "tool_execution_end", toolName: "bash", ...executionError() }, context.ctx);
+  await harness.handler("tool_execution_end")({ type: "tool_execution_end", toolName: "bash", ...executionError() }, context.ctx);
+  await harness.handler("tool_execution_end")({ type: "tool_execution_end", toolName: "bash", ...executionError() }, context.ctx);
 
   assert.equal(context.aborts.length, 0);
 });
@@ -84,13 +84,13 @@ test("successful and execution-error tool results reset the schema guard", async
   const harness = await createHarness(t);
   const context = createContext();
 
-  await harness.handler("tool_result")({ type: "tool_result", toolName: "gsd_plan_slice", ...validationError() }, context.ctx);
-  await harness.handler("tool_result")({ type: "tool_result", toolName: "bash", ...executionError() }, context.ctx);
-  await harness.handler("tool_result")({ type: "tool_result", toolName: "gsd_plan_slice", ...validationError() }, context.ctx);
+  await harness.handler("tool_execution_end")({ type: "tool_execution_end", toolName: "gsd_plan_slice", ...validationError() }, context.ctx);
+  await harness.handler("tool_execution_end")({ type: "tool_execution_end", toolName: "bash", ...executionError() }, context.ctx);
+  await harness.handler("tool_execution_end")({ type: "tool_execution_end", toolName: "gsd_plan_slice", ...validationError() }, context.ctx);
   assert.equal(context.aborts.length, 0);
 
-  await harness.handler("tool_result")({ type: "tool_result", toolName: "read", ...success() }, context.ctx);
-  await harness.handler("tool_result")({ type: "tool_result", toolName: "gsd_plan_slice", ...validationError() }, context.ctx);
+  await harness.handler("tool_execution_end")({ type: "tool_execution_end", toolName: "read", ...success() }, context.ctx);
+  await harness.handler("tool_execution_end")({ type: "tool_execution_end", toolName: "gsd_plan_slice", ...validationError() }, context.ctx);
   assert.equal(context.aborts.length, 0);
 });
 
@@ -98,11 +98,11 @@ test("mixed preparation and successful tool results preserve but do not incremen
   const harness = await createHarness(t);
   const context = createContext();
 
-  await harness.handler("tool_result")({ type: "tool_result", toolName: "gsd_plan_slice", ...validationError() }, context.ctx);
-  await harness.handler("tool_result")({ type: "tool_result", toolName: "read", ...success() }, context.ctx);
+  await harness.handler("tool_execution_end")({ type: "tool_execution_end", toolName: "gsd_plan_slice", ...validationError() }, context.ctx);
+  await harness.handler("tool_execution_end")({ type: "tool_execution_end", toolName: "read", ...success() }, context.ctx);
   assert.equal(context.aborts.length, 0);
 
-  await harness.handler("tool_result")({ type: "tool_result", toolName: "gsd_plan_slice", ...validationError() }, context.ctx);
+  await harness.handler("tool_execution_end")({ type: "tool_execution_end", toolName: "gsd_plan_slice", ...validationError() }, context.ctx);
   assert.equal(context.aborts.length, 0);
 });
 
@@ -110,9 +110,9 @@ test("successful tool results reset the schema guard", async (t) => {
   const harness = await createHarness(t);
   const context = createContext();
 
-  await harness.handler("tool_result")({ type: "tool_result", toolName: "gsd_plan_slice", ...validationError() }, context.ctx);
-  await harness.handler("tool_result")({ type: "tool_result", toolName: "read", ...success() }, context.ctx);
-  await harness.handler("tool_result")({ type: "tool_result", toolName: "gsd_plan_slice", ...validationError() }, context.ctx);
+  await harness.handler("tool_execution_end")({ type: "tool_execution_end", toolName: "gsd_plan_slice", ...validationError() }, context.ctx);
+  await harness.handler("tool_execution_end")({ type: "tool_execution_end", toolName: "read", ...success() }, context.ctx);
+  await harness.handler("tool_execution_end")({ type: "tool_execution_end", toolName: "gsd_plan_slice", ...validationError() }, context.ctx);
 
   assert.equal(context.aborts.length, 0);
 });
@@ -193,8 +193,8 @@ test("provider errors do not count as manual intervention", async (t) => {
   await stop(harness, "error", "temporary model outage");
   assert.equal(harness.timers.pending().length, 1);
 
-  await notify(harness, "Auto-mode paused due to provider error: unauthorized", "warning");
-  await stop(harness, "blocked", "Auto-mode paused (Escape). Type to interact, or /gsd auto to resume.");
+  await notify(harness, "Provider transport failed with a recoverable error", "warning");
+  await stop(harness, "blocked", "provider transport failed");
 
   assert.equal(harness.timers.pending().length, 1);
   assert.doesNotMatch(harness.systemMessages.at(-1).message.content, /Manual intervention detected/);
@@ -241,7 +241,7 @@ test("official stop and review notifications cancel pending with-context retry",
     assert.equal(harness.timers.pending().length, 1);
 
     await notify(harness, message, "warning");
-    await stop(harness, "blocked", "Auto-mode paused (Escape). Type to interact, or /gsd auto to resume.");
+    await stop(harness, "blocked", "operator review required");
 
     assert.equal(harness.timers.pending().length, 0);
     assert.match(harness.systemMessages.at(-1).message.content, /Manual intervention detected/);

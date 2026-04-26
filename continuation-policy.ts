@@ -8,8 +8,6 @@ export const CONTINUATION_POLICY = {
   resumeCommand: "/gsd auto",
 };
 
-export const WITHOUT_CONTEXT_STOP_PHRASES = ["auto-mode paused", "step-mode paused", "paused (escape)"];
-
 type ManualInterventionRule = readonly RegExp[];
 
 export const MANUAL_INTERVENTION_RULES: readonly ManualInterventionRule[] = [

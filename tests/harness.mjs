@@ -85,6 +85,12 @@ export function createContext() {
       abort() {
         aborts.push({});
       },
+      isIdle() {
+        return true;
+      },
+      getContextUsage() {
+        return undefined;
+      },
       ui: {
         notify(content, type) {
           notifications.push({ content, type });
@@ -109,10 +115,13 @@ export async function notify(harness, message, kind = "error") {
   await harness.handler("notification")({ type: "notification", kind, message });
 }
 
-export async function stop(harness, reason, errorMessage = "") {
-  await harness.handler("stop")({
-    type: "stop",
-    reason,
-    lastMessage: errorMessage ? { errorMessage } : undefined,
-  });
+export async function stop(harness, reason, errorMessage = "", ctx) {
+  await harness.handler("stop")(
+    {
+      type: "stop",
+      reason,
+      lastMessage: errorMessage ? { errorMessage } : undefined,
+    },
+    ctx,
+  );
 }

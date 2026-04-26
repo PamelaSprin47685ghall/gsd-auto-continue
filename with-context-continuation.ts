@@ -9,9 +9,9 @@ export type ToolCallLoopEvent = {
   input?: unknown;
 };
 
-export type ToolResultEvent = {
+export type ToolExecutionEndLoopEvent = {
   isError?: boolean;
-  content?: TextContent[];
+  result?: unknown;
 };
 
 type WithContextContinuationOptions = {
@@ -35,15 +35,19 @@ const PREPARATION_ERROR_PATTERNS = [
 
 const STRICT_IDENTICAL_LOOP_TOOLS = new Set(["ask_user_questions"]);
 
-const resultText = (result: { content?: TextContent[] }) =>
-  (Array.isArray(result.content) ? result.content : [])
+const resultText = (result: unknown) => {
+  if (typeof result === "string") return result;
+  if (!result || typeof result !== "object") return "";
+
+  return (Array.isArray((result as { content?: TextContent[] }).content) ? (result as { content?: TextContent[] }).content : [])
     .filter((content) => content?.type === "text" && typeof content.text === "string")
     .map((content) => content.text as string)
     .join("\n")
     .trim();
+};
 
-const isPreparationError = (result: { isError?: boolean; content?: TextContent[] }) =>
-  result.isError === true && PREPARATION_ERROR_PATTERNS.some((pattern) => pattern.test(resultText(result)));
+const isPreparationError = (event: ToolExecutionEndLoopEvent) =>
+  event.isError === true && PREPARATION_ERROR_PATTERNS.some((pattern) => pattern.test(resultText(event.result)));
 
 const normalize = (value: unknown): unknown => {
   if (Array.isArray(value)) return value.map(normalize);
@@ -183,7 +187,7 @@ export function createWithContextContinuation({
       );
     },
 
-    handleToolResult(event: ToolResultEvent, ctx: ExtensionContext) {
+    handleToolExecutionEnd(event: ToolExecutionEndLoopEvent, ctx: ExtensionContext) {
       if (isWithoutContextRecoveryRunning()) return;
 
       if (typeof event.isError !== "boolean") return;

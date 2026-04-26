@@ -11,7 +11,7 @@ const REGISTERED_HOOKS = [
   "session_start",
   "stop",
   "tool_call",
-  "tool_result",
+  "tool_execution_end",
 ];
 
 test("registers only the hooks the extension actually uses", async (t) => {
@@ -42,11 +42,11 @@ test("status send failures do not kill tool guards", async (t) => {
   const context = createContext();
   const validationError = {
     isError: true,
-    content: [{ type: "text", text: 'Validation failed for tool "gsd_plan_slice": missing tasks' }],
+    result: { content: [{ type: "text", text: 'Validation failed for tool "gsd_plan_slice": missing tasks' }] },
   };
 
-  await harness.handler("tool_result")({ type: "tool_result", toolName: "gsd_plan_slice", ...validationError }, context.ctx);
-  await harness.handler("tool_result")({ type: "tool_result", toolName: "gsd_plan_slice", ...validationError }, context.ctx);
+  await harness.handler("tool_execution_end")({ type: "tool_execution_end", toolName: "gsd_plan_slice", ...validationError }, context.ctx);
+  await harness.handler("tool_execution_end")({ type: "tool_execution_end", toolName: "gsd_plan_slice", ...validationError }, context.ctx);
 
   assert.equal(context.aborts.length, 1);
   assert.match(context.notifications.at(-1).content, /schema failures are repeating/);

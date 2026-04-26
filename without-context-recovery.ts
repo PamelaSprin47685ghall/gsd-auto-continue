@@ -8,6 +8,7 @@ type WithoutContextRecoveryOptions = {
 export function createWithoutContextRecovery({ sendSystem, sendUserMessage }: WithoutContextRecoveryOptions) {
   let loops = 0;
   let recovering = false;
+  let resumeCommand = CONTINUATION_POLICY.resumeCommand;
   let timer: ReturnType<typeof setTimeout> | null = null;
 
   const cancelTimer = () => {
@@ -40,9 +41,10 @@ export function createWithoutContextRecovery({ sendSystem, sendUserMessage }: Wi
       return wasActive;
     },
 
-    scheduleRecovery(detail: string) {
+    scheduleRecovery(detail: string, command = CONTINUATION_POLICY.resumeCommand) {
       if (timer) return;
 
+      resumeCommand = command;
       const loop = ++loops;
       recovering = true;
       sendSystem(`🚨 [AutoContinue] Auto-mode paused. Starting without-context recovery loop ${loop}.`);
@@ -61,7 +63,7 @@ export function createWithoutContextRecovery({ sendSystem, sendUserMessage }: Wi
 
       timer = setTimeout(() => {
         timer = null;
-        sendUserMessage(CONTINUATION_POLICY.resumeCommand);
+        sendUserMessage(resumeCommand);
       }, 1500);
     },
   };

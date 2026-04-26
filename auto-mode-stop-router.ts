@@ -1,10 +1,8 @@
-import type { ExtensionAPI, ExtensionContext, InputEvent, NotificationEvent, SessionEndEvent, StopEvent } from "@gsd/pi-coding-agent";
-import { CONTINUATION_POLICY, WITHOUT_CONTEXT_STOP_PHRASES, matchesManualIntervention } from "./continuation-policy.ts";
-import { createWithContextContinuation, type ToolCallLoopEvent, type ToolResultEvent } from "./with-context-continuation.ts";
+import type { ExtensionAPI, ExtensionContext, InputEvent, NotificationEvent, SessionEndEvent, StopEvent, ToolExecutionEndEvent } from "@gsd/pi-coding-agent";
+import { CONTINUATION_POLICY, matchesManualIntervention } from "./continuation-policy.ts";
+import { createWithContextContinuation, type ToolCallLoopEvent, type ToolExecutionEndLoopEvent } from "./with-context-continuation.ts";
 import { createWithoutContextRecovery } from "./without-context-recovery.ts";
-
-const includesAny = (text: string, phrases: readonly string[]) =>
-  phrases.some((phrase) => text.toLowerCase().includes(phrase));
+import { readGsdAutoSnapshot, isContextOverflow } from "./gsd-auto-state.ts";
 
 const stopError = (event: StopEvent) => {
   const lastMessage = event.lastMessage as { errorMessage?: unknown } | undefined;
@@ -14,6 +12,7 @@ const stopError = (event: StopEvent) => {
 export function registerAutoModeStopRouter(pi: ExtensionAPI) {
   const notifications: string[] = [];
   let lastContext: ExtensionContext | undefined;
+  let overflowDelegatedToCore = false;
 
   const errorText = (error: unknown) => (error instanceof Error ? error.message : String(error));
 
@@ -47,16 +46,19 @@ export function registerAutoModeStopRouter(pi: ExtensionAPI) {
     sendSystem("↪️ [AutoContinue] Dispatching recovery prompt.");
 
     try {
-      pi.sendUserMessage(content);
-      return;
+      if (lastContext && !lastContext.isIdle()) {
+        sendSystem("ℹ️ [AutoContinue] Agent is already processing. Waiting for the active turn to finish before sending another recovery message.");
+        return;
+      }
     } catch (error) {
-      sendSystem(`⚠️ [AutoContinue] sendUserMessage failed: ${errorText(error)}. Trying hidden trigger-turn fallback.`, "warning");
+      reportInternalFailure("idle check", error);
+      return;
     }
 
     try {
-      pi.sendMessage({ customType: "auto-continue-recovery", content, display: false }, { triggerTurn: true });
+      pi.sendUserMessage(content);
     } catch (error) {
-      reportInternalFailure("sendUserMessage fallback", error);
+      sendSystem(`❌ [AutoContinue] sendUserMessage failed visibly: ${errorText(error)}. No hidden recovery turn was dispatched.`, "error");
     }
   };
 
@@ -88,6 +90,13 @@ export function registerAutoModeStopRouter(pi: ExtensionAPI) {
   };
 
   const recoveringProgrammatically = () => withContext.active || withoutContext.active;
+  const resumeCommand = (stepMode: boolean) => (stepMode ? "/gsd next" : CONTINUATION_POLICY.resumeCommand);
+  const recoverableGsdPause = (reason: StopEvent["reason"], errorContext: unknown) => reason !== "cancelled" || errorContext !== undefined;
+
+  const isGsdPaused = async () => {
+    const snapshot = await readGsdAutoSnapshot();
+    return snapshot?.paused === true && snapshot.active === false ? snapshot : undefined;
+  };
 
   const onSafe = (eventName: string, handler: (event: unknown, ctx?: ExtensionContext) => unknown) => {
     pi.on(eventName as never, async (event: unknown, ctx?: ExtensionContext) => {
@@ -123,9 +132,9 @@ export function registerAutoModeStopRouter(pi: ExtensionAPI) {
     return withContext.handleToolCallLoop(event as ToolCallLoopEvent, ctx);
   });
 
-  onSafe("tool_result", (event, ctx) => {
+  onSafe("tool_execution_end", (event, ctx) => {
     if (!ctx) return;
-    withContext.handleToolResult(event as ToolResultEvent, ctx);
+    withContext.handleToolExecutionEnd(event as ToolExecutionEndLoopEvent & ToolExecutionEndEvent, ctx);
   });
 
   onSafe("input", (event) => {
@@ -144,21 +153,49 @@ export function registerAutoModeStopRouter(pi: ExtensionAPI) {
     rememberNotification(message);
   });
 
-  onSafe("stop", (event) => {
+  onSafe("stop", async (event) => {
     const stop = event as StopEvent;
     const detail = drainDetail(stopError(stop));
 
     if (withoutContext.recovering && stop.reason === "completed") {
+      overflowDelegatedToCore = false;
       withoutContext.resumeAutoMode();
       return;
     }
 
     if (stop.reason === "completed") {
+      overflowDelegatedToCore = false;
       standDown(false);
       return;
     }
 
     if (withContext.handleProgrammaticAbort()) return;
+
+    const pausedAuto = await isGsdPaused();
+    if (pausedAuto && recoverableGsdPause(stop.reason, pausedAuto.errorContext)) {
+      withContext.standDown();
+      withoutContext.scheduleRecovery(
+        pausedAuto.errorContext ? `${pausedAuto.errorContext.category}: ${pausedAuto.errorContext.message}` : detail || String(stop.reason),
+        resumeCommand(pausedAuto.stepMode),
+      );
+      return;
+    }
+
+    if (await isContextOverflow(stop.lastMessage, lastContext?.getContextUsage()?.contextWindow)) {
+      withContext.standDown();
+
+      if (!overflowDelegatedToCore) {
+        overflowDelegatedToCore = true;
+        withoutContext.cancelPending();
+        sendSystem("ℹ️ [AutoContinue] Context overflow detected. Standing down while Pi core runs its overflow compaction recovery.");
+        return;
+      }
+
+      withoutContext.scheduleRecovery(detail || "context overflow");
+      return;
+    }
+
+    overflowDelegatedToCore = false;
 
     if (/\boperation aborted\b/i.test(detail)) {
       standDown(true);
@@ -167,12 +204,6 @@ export function registerAutoModeStopRouter(pi: ExtensionAPI) {
 
     if (matchesManualIntervention(detail)) {
       standDown(true);
-      return;
-    }
-
-    if (includesAny(detail, WITHOUT_CONTEXT_STOP_PHRASES)) {
-      withContext.standDown();
-      withoutContext.scheduleRecovery(detail || String(stop.reason));
       return;
     }
 
