@@ -20,12 +20,18 @@ type InstallOptions = {
   isEnabled?: () => boolean | Promise<boolean>;
 };
 
+type AgentMessageLike = {
+  customType?: unknown;
+};
+
 const PATCH_MARKER = Symbol.for("gsd-auto-continue.semantic-gsd-validation.patch");
 const TOOL_MARKER = Symbol.for("gsd-auto-continue.semantic-gsd-validation.tool");
 
 const fallbackSchema = { type: "object", additionalProperties: true };
 
 const isGsdTool = (tool: AgentTool) => /^gsd_/.test(tool.name);
+const isGsdAutoMessage = (message: unknown) => typeof message === "object" && message !== null && (message as AgentMessageLike).customType === "gsd-auto";
+const hasGsdAutoMessage = (value: unknown): boolean => Array.isArray(value) ? value.some(hasGsdAutoMessage) : isGsdAutoMessage(value);
 
 const semanticParameters = (parameters: unknown) => ({
   anyOf: [parameters ?? fallbackSchema, fallbackSchema],
@@ -89,9 +95,13 @@ export function wrapGsdToolForSemanticValidation(tool: AgentTool, validateToolAr
   };
 }
 
-async function withSemanticGsdValidation<T>(agent: AgentLike, options: Required<InstallOptions>, run: () => Promise<T>) {
+async function shouldEnableSemanticValidation(agent: AgentLike, options: Required<InstallOptions>, runArgs: unknown[]) {
+  return hasGsdAutoMessage(runArgs[0]) || hasGsdAutoMessage(agent.state?.messages) || await options.isEnabled();
+}
+
+async function withSemanticGsdValidation<T>(agent: AgentLike, options: Required<InstallOptions>, runArgs: unknown[], run: () => Promise<T>) {
   const tools = agent.state?.tools;
-  if (!tools?.some(isGsdTool) || !(await options.isEnabled())) return run();
+  if (!tools?.some(isGsdTool) || !(await shouldEnableSemanticValidation(agent, options, runArgs))) return run();
 
   const wrappedTools = tools.map((tool) => wrapGsdToolForSemanticValidation(tool, options.validateToolArguments));
   const setTools = agent.setTools?.bind(agent) ?? ((nextTools: AgentTool[]) => {
@@ -133,11 +143,11 @@ export async function installSemanticGsdValidationPatch(options: InstallOptions 
   };
 
   prototype.prompt = function patchedPrompt(this: AgentLike, ...args: unknown[]) {
-    return withSemanticGsdValidation(this, patchOptions, () => Reflect.apply(prompt, this, args) as Promise<unknown>);
+    return withSemanticGsdValidation(this, patchOptions, args, () => Reflect.apply(prompt, this, args) as Promise<unknown>);
   };
 
   prototype.continue = function patchedContinue(this: AgentLike, ...args: unknown[]) {
-    return withSemanticGsdValidation(this, patchOptions, () => Reflect.apply(continueRun, this, args) as Promise<unknown>);
+    return withSemanticGsdValidation(this, patchOptions, args, () => Reflect.apply(continueRun, this, args) as Promise<unknown>);
   };
 
   prototype[PATCH_MARKER] = true;

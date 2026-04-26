@@ -105,6 +105,76 @@ test("agent patch wraps gsd tools only during active auto-mode prompt", async ()
   assert.equal(agent.state.tools[0], originalGsdTool);
 });
 
+test("agent patch wraps gsd-auto custom prompt even when dashboard snapshot is not active", async () => {
+  class FakeAgent {
+    constructor(tools) {
+      this.state = { tools, messages: [] };
+    }
+
+    setTools(tools) {
+      this.state.tools = tools;
+    }
+
+    async prompt(message) {
+      this.promptMessage = message;
+      this.promptTools = this.state.tools;
+    }
+
+    async continue() {}
+  }
+
+  await installSemanticGsdValidationPatch({
+    AgentClass: FakeAgent,
+    validateToolArguments: () => ({ ok: "validated" }),
+    isEnabled: () => false,
+  });
+
+  const originalGsdTool = gsdTool();
+  const agent = new FakeAgent([originalGsdTool]);
+
+  await agent.prompt({ role: "custom", customType: "gsd-auto", content: "plan milestone", display: false });
+
+  assert.notEqual(agent.promptTools[0], originalGsdTool);
+  assert.deepEqual(agent.promptTools[0].parameters.anyOf[0], originalGsdTool.parameters);
+  assert.equal(agent.state.tools[0], originalGsdTool);
+});
+
+test("agent patch wraps continue when current session contains a gsd-auto message", async () => {
+  class FakeAgent {
+    constructor(tools) {
+      this.state = {
+        tools,
+        messages: [{ role: "custom", customType: "gsd-auto", content: "plan milestone", display: false }],
+      };
+    }
+
+    setTools(tools) {
+      this.state.tools = tools;
+    }
+
+    async prompt() {}
+
+    async continue() {
+      this.continueTools = this.state.tools;
+    }
+  }
+
+  await installSemanticGsdValidationPatch({
+    AgentClass: FakeAgent,
+    validateToolArguments: () => ({ ok: "validated" }),
+    isEnabled: () => false,
+  });
+
+  const originalGsdTool = gsdTool();
+  const agent = new FakeAgent([originalGsdTool]);
+
+  await agent.continue();
+
+  assert.notEqual(agent.continueTools[0], originalGsdTool);
+  assert.deepEqual(agent.continueTools[0].parameters.anyOf[0], originalGsdTool.parameters);
+  assert.equal(agent.state.tools[0], originalGsdTool);
+});
+
 test("agent patch is inert outside active auto-mode", async () => {
   class FakeAgent {
     constructor(tools) {
