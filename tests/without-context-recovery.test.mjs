@@ -94,6 +94,7 @@ test("repeated context overflow stop falls back to without-context recovery", as
 });
 
 test("busy recovery dispatch waits visibly without hidden trigger turns", async (t) => {
+  withGsdSnapshot(t, { active: false, paused: true, stepMode: false, basePath: "/repo" });
   const harness = await createHarness(t);
   const { ctx } = createContext();
   ctx.isIdle = () => false;
@@ -107,6 +108,7 @@ test("busy recovery dispatch waits visibly without hidden trigger turns", async 
 });
 
 test("sendUserMessage failures are reported visibly without hidden trigger turns", async (t) => {
+  withGsdSnapshot(t, { active: false, paused: true, stepMode: false, basePath: "/repo" });
   const harness = await createHarness(t, { throwSendUserMessage: true });
 
   await stop(harness, "error", "UAT failure");

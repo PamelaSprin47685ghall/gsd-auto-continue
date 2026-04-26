@@ -19,21 +19,14 @@ const success = () => ({
   result: { content: [{ type: "text", text: "ok" }] },
 });
 
-test("ordinary failures retry in the current context and do not restart auto-mode", async (t) => {
+test("ordinary stop errors do not trigger recovery", async (t) => {
   const harness = await createHarness(t);
 
   await stop(harness, "error", "ECONNRESET while fetching model stream");
 
-  const [timer] = harness.timers.pending();
-  assert.equal(timer.delayMs, Math.round(1000 * 60 ** (1 / 10)));
-  assert.match(harness.systemMessages.at(-1).message.content, /Retrying with context in/);
-
-  await harness.timers.flushNext();
-
-  assert.equal(harness.userMessages.length, 1);
-  assert.match(harness.userMessages[0], /Continue from the current context/);
-  assert.match(harness.userMessages[0], /ECONNRESET/);
-  assert.notEqual(harness.userMessages[0].trim(), "/gsd auto");
+  assert.equal(harness.timers.pending().length, 0);
+  assert.equal(harness.userMessages.length, 0);
+  assert.equal(harness.systemMessages.length, 0);
 });
 
 test("schema-preparation tool results abort before the provider can make a third call", async (t) => {
@@ -53,6 +46,18 @@ test("schema-preparation tool results abort before the provider can make a third
   assert.match(harness.userMessages.at(-1), /Two consecutive tool calls failed before execution/);
   assert.notEqual(harness.userMessages.at(-1).trim(), "/gsd auto");
   assert.doesNotMatch(harness.systemMessages.at(-1).message.content, /Manual intervention detected/);
+});
+
+test("single tool validation failure followed by stop does not trigger recovery", async (t) => {
+  const harness = await createHarness(t);
+  const context = createContext();
+
+  await harness.handler("tool_execution_end")({ type: "tool_execution_end", toolName: "lsp", ...validationError('Validation failed for tool "lsp": missing action') }, context.ctx);
+  await stop(harness, "error", "Operation aborted");
+
+  assert.equal(context.aborts.length, 0);
+  assert.equal(harness.timers.pending().length, 0);
+  assert.equal(harness.userMessages.length, 0);
 });
 
 test("schema-preparation guard recognizes validation errors after tool-name prefixes", async (t) => {
@@ -187,24 +192,28 @@ test("manual intervention rule matching uses simple and-or conditions", () => {
   assert.equal(matchesManualIntervention("Queued background job completed"), false);
 });
 
+async function armSchemaRetry(harness, context = createContext()) {
+  await harness.handler("tool_execution_end")({ type: "tool_execution_end", toolName: "gsd_plan_slice", ...validationError() }, context.ctx);
+  await harness.handler("tool_execution_end")({ type: "tool_execution_end", toolName: "gsd_plan_slice", ...validationError() }, context.ctx);
+  await stop(harness, "error", "Operation aborted");
+  assert.equal(harness.timers.pending().length, 1);
+  return context;
+}
+
 test("provider errors do not count as manual intervention", async (t) => {
   const harness = await createHarness(t);
-
-  await stop(harness, "error", "temporary model outage");
-  assert.equal(harness.timers.pending().length, 1);
 
   await notify(harness, "Provider transport failed with a recoverable error", "warning");
   await stop(harness, "blocked", "provider transport failed");
 
-  assert.equal(harness.timers.pending().length, 1);
-  assert.doesNotMatch(harness.systemMessages.at(-1).message.content, /Manual intervention detected/);
+  assert.equal(harness.timers.pending().length, 0);
+  assert.equal(harness.userMessages.length, 0);
+  assert.equal(harness.systemMessages.length, 0);
 });
 
 test("manual intervention cancels pending with-context retry", async (t) => {
   const harness = await createHarness(t);
-
-  await stop(harness, "error", "temporary model outage");
-  assert.equal(harness.timers.pending().length, 1);
+  await armSchemaRetry(harness);
 
   await notify(harness, "manual intervention requested by operator", "input_needed");
   await stop(harness, "error", "manual intervention requested by operator");
@@ -215,9 +224,7 @@ test("manual intervention cancels pending with-context retry", async (t) => {
 
 test("manual operation abort cancels pending with-context retry when it was not self-triggered", async (t) => {
   const harness = await createHarness(t);
-
-  await stop(harness, "error", "temporary model outage");
-  assert.equal(harness.timers.pending().length, 1);
+  await armSchemaRetry(harness);
 
   await stop(harness, "error", "Operation aborted");
 
@@ -236,9 +243,7 @@ test("official stop and review notifications cancel pending with-context retry",
     "Recovery stopped because operator action is required.",
   ]) {
     const harness = await createHarness(t);
-
-    await stop(harness, "error", "temporary model outage");
-    assert.equal(harness.timers.pending().length, 1);
+    await armSchemaRetry(harness);
 
     await notify(harness, message, "warning");
     await stop(harness, "blocked", "operator review required");

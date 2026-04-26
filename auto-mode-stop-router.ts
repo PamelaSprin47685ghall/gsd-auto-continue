@@ -213,6 +213,6 @@ export function registerAutoModeStopRouter(pi: ExtensionAPI) {
     }
 
     withoutContext.cancelPending();
-    withContext.scheduleRetry("failure", detail || String(stop.reason));
+    standDown(false);
   });
 }
