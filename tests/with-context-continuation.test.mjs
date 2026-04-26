@@ -35,6 +35,23 @@ test("ordinary stop errors do not trigger recovery", async (t) => {
   assert.equal(harness.systemMessages.length, 0);
 });
 
+test("active auto-mode stop errors retry with current context", async (t) => {
+  withAutoActive(t);
+  const harness = await createHarness(t);
+  const context = createContext();
+  const providerError = 'Error: {"error":{"message":"","code":502,"status":"Bad Gateway"}}';
+
+  await stop(harness, "error", providerError, context.ctx);
+
+  assert.equal(harness.timers.pending().length, 1);
+  assert.match(context.notifications.at(-1).content, /Retrying with context/);
+
+  await harness.timers.flushNext();
+  assert.match(harness.userMessages.at(-1), /Continue from the current context/);
+  assert.match(harness.userMessages.at(-1), /auto_stop_error/);
+  assert.match(harness.userMessages.at(-1), /502/);
+});
+
 test("schema-preparation tool results abort before the provider can make a third call", async (t) => {
   withAutoActive(t);
   const harness = await createHarness(t);

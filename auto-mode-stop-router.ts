@@ -226,6 +226,12 @@ export function registerAutoModeStopRouter(pi: ExtensionAPI) {
       return;
     }
 
+    if (gsdSnapshot?.active === true && stop.reason === "error") {
+      withoutContext.cancelPending();
+      withContext.scheduleRetry("auto_stop_error", detail || "GSD auto-mode stopped with an error before completing the current turn.");
+      return;
+    }
+
     withoutContext.cancelPending();
     standDown(false);
   });
