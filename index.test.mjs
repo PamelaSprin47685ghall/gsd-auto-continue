@@ -52,10 +52,13 @@ test('gsd-auto-continue', async (t) => {
   await t.test('handles stop event with reason error (With-Context Continuation)', async () => {
     userMessages.length = 0;
     notifications.length = 0;
-    
+
+    // Set auto mode
+    events['unit_start']({ mode: 'auto' });
+
     // Simulate error notification
     events['notification']({ type: 'error', message: 'Something went wrong' });
-    
+
     // Simulate stop event
     events['stop']({ reason: 'error', error: 'Stop error' });
     
@@ -67,6 +70,23 @@ test('gsd-auto-continue', async (t) => {
     assert.ok(userMessages[0].includes('Something went wrong'), 'message should contain the notification error');
     assert.strictEqual(notifications.length, 1, 'should have sent one notification');
     assert.ok(notifications[0].msg.includes('attempt 1/5'), 'notification should mention attempt number');
+  });
+
+  await t.test('does not trigger with-context continuation in manual mode', async () => {
+    userMessages.length = 0;
+    notifications.length = 0;
+
+    // Simulate manual mode (unit_start with step mode, then unit_end resets to manual)
+    events['unit_start']({ mode: 'step' });
+    events['unit_end']({ status: 'failed' });
+
+    events['notification']({ type: 'error', message: 'Manual error' });
+    events['stop']({ reason: 'error', error: 'Stop error' });
+
+    await new Promise(resolve => setTimeout(resolve, 1100));
+
+    assert.strictEqual(userMessages.length, 0, 'should not send any user message in manual mode');
+    assert.strictEqual(notifications.length, 0, 'should not send any notification in manual mode');
   });
 
   await t.test('handles stop event with reason blocked (Without-Context Recovery)', () => {

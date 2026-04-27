@@ -66,6 +66,7 @@ export default function autoContinuePlugin(pi) {
 
   // 2.1 With-Context Continuation
   function triggerWithContextContinuation(pi, reason, message) {
+    if (mode !== "auto") return;
     withContextRetryCount++;
     if (withContextRetryCount > 5) {
       triggerWithoutContextRecovery(pi, reason, message);
