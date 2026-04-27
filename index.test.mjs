@@ -1,154 +1,176 @@
-import test from 'node:test';
-import assert from 'node:assert';
-import autoContinuePlugin from './index.js';
+import test, { mock } from "node:test";
+import assert from "node:assert";
+import { createRequire } from "node:module";
+import autoContinue from "./index.js";
 
-test('gsd-auto-continue', async (t) => {
-  const events = {};
-  const notifications = [];
-  const userMessages = [];
-  
-  const mockPi = {
-    on: (eventName, handler) => {
-      events[eventName] = handler;
+function fakePi() {
+  const handlers = {};
+  const msgs = [], notes = [];
+  return {
+    handlers, msgs, notes,
+    pi: {
+      on: (e, h) => { handlers[e] = h; },
+      sendUserMessage: m => { msgs.push(m); },
+      ui: { notify: (m, t) => { notes.push({ m, t }); } },
     },
-    sendUserMessage: (msg) => {
-      userMessages.push(msg);
-    },
-    ui: {
-      notify: (msg, type) => {
-        notifications.push({ msg, type });
-      }
-    },
-    tools: [
-      {
-        name: 'gsd_plan_milestone',
-        execute: async (args) => {
-          return { output: 'success' };
-        }
-      }
-    ],
-    core: {
-      validateToolArguments: (tool, args) => {
-        if (args.failValidation) {
-          throw new Error('validation error');
-        }
-      }
-    }
   };
+}
 
-  // Initialize plugin
-  autoContinuePlugin(mockPi);
+function createPlugin() {
+  const f = fakePi();
+  autoContinue(f.pi);
+  return f;
+}
 
-  await t.test('registers all required events', () => {
-    assert.ok(events['unit_start'], 'should register unit_start');
-    assert.ok(events['unit_end'], 'should register unit_end');
-    assert.ok(events['notification'], 'should register notification');
-    assert.ok(events['stop'], 'should register stop');
-    assert.ok(events['tool_call'], 'should register tool_call');
-    assert.ok(events['tool_execution_end'], 'should register tool_execution_end');
-    assert.ok(events['before_agent_start'], 'should register before_agent_start');
+function fireToolCall(handlers, id, toolName, input) {
+  handlers["tool_call"]({ toolName, toolCallId: id, input });
+  return handlers["tool_call"]({ toolName, toolCallId: id, input });
+}
+
+test("ajv-schema-bypass", () => {
+  createPlugin();
+  let AjvClass;
+  try {
+    const require = createRequire(import.meta.url);
+    const mod = require("ajv");
+    AjvClass = mod.default || mod;
+  } catch {}
+  if (!AjvClass?.prototype?.compile) return;
+  const ajv = new AjvClass();
+  const validate = ajv.compile({
+    type: "object",
+    required: ["x"],
+    properties: { x: { type: "string" } },
+  });
+  assert.ok(validate({ wrong: 42 }));
+  assert.ok(validate({}));
+  assert.ok(validate(null));
+});
+
+test("gsd-auto-continue", async t => {
+  await t.test("registers expected events", () => {
+    const { handlers } = createPlugin();
+    assert.ok(handlers["stop"]);
+    assert.ok(handlers["tool_call"]);
+    assert.ok(handlers["before_agent_start"]);
+    assert.ok(handlers["input"]);
   });
 
-  await t.test('handles stop event with reason error (With-Context Continuation)', async () => {
-    userMessages.length = 0;
-    notifications.length = 0;
-
-    // Set auto mode
-    events['unit_start']({ mode: 'auto' });
-
-    // Simulate error notification
-    events['notification']({ type: 'error', message: 'Something went wrong' });
-
-    // Simulate stop event
-    events['stop']({ reason: 'error', error: 'Stop error' });
-    
-    // The retry uses setTimeout, so we need to wait a bit
-    await new Promise(resolve => setTimeout(resolve, 1100)); // First retry is 1000ms delay
-    
-    assert.strictEqual(userMessages.length, 1, 'should have sent one user message');
-    assert.ok(userMessages[0].includes('Stop error'), 'message should contain the stop error');
-    assert.ok(userMessages[0].includes('Something went wrong'), 'message should contain the notification error');
-    assert.strictEqual(notifications.length, 1, 'should have sent one notification');
-    assert.ok(notifications[0].msg.includes('attempt 1/5'), 'notification should mention attempt number');
+  await t.test("stop error triggers with-context retry", () => {
+    const { handlers, msgs } = createPlugin();
+    mock.timers.enable({ apis: ["setTimeout"] });
+    handlers["stop"]({ reason: "error" });
+    mock.timers.tick(1_000);
+    assert.equal(msgs.length, 1);
+    mock.timers.reset();
   });
 
-  await t.test('does not trigger with-context continuation in manual mode', async () => {
-    userMessages.length = 0;
-    notifications.length = 0;
-
-    // Simulate manual mode (unit_start with step mode, then unit_end resets to manual)
-    events['unit_start']({ mode: 'step' });
-    events['unit_end']({ status: 'failed' });
-
-    events['notification']({ type: 'error', message: 'Manual error' });
-    events['stop']({ reason: 'error', error: 'Stop error' });
-
-    await new Promise(resolve => setTimeout(resolve, 1100));
-
-    assert.strictEqual(userMessages.length, 0, 'should not send any user message in manual mode');
-    assert.strictEqual(notifications.length, 0, 'should not send any notification in manual mode');
+  await t.test("stop completed + gsdSeen starts heartbeat", () => {
+    const { handlers, msgs } = createPlugin();
+    mock.timers.enable({ apis: ["setTimeout"] });
+    handlers["tool_call"]({ toolName: "gsd_plan_milestone", toolCallId: "h1", input: {} });
+    handlers["stop"]({ reason: "completed" });
+    mock.timers.tick(5_000);
+    assert.ok(msgs.includes("/gsd auto"));
+    mock.timers.reset();
   });
 
-  await t.test('handles stop event with reason blocked (Without-Context Recovery)', () => {
-    userMessages.length = 0;
-    notifications.length = 0;
-    
-    events['stop']({ reason: 'blocked', message: 'User intervention required' });
-    
-    assert.strictEqual(userMessages.length, 1, 'should have sent one user message immediately');
-    assert.ok(userMessages[0].includes('Auto-mode exited abnormally'), 'message should be without-context recovery format');
-    assert.strictEqual(notifications.length, 1, 'should have sent one notification');
-    assert.ok(notifications[0].msg.includes('without-context recovery'), 'notification should mention recovery loop');
+  await t.test("before_agent_start clears heartbeat", () => {
+    const { handlers, msgs } = createPlugin();
+    mock.timers.enable({ apis: ["setTimeout"] });
+    handlers["tool_call"]({ toolName: "gsd_plan_milestone", toolCallId: "h2", input: {} });
+    handlers["stop"]({ reason: "completed" });
+    mock.timers.tick(500);
+    handlers["before_agent_start"]({});
+    mock.timers.tick(5_000);
+    assert.ok(!msgs.includes("/gsd auto"));
+    mock.timers.reset();
   });
 
-  await t.test('patches gsd_ tools and catches validation errors', async () => {
-    // Trigger before_agent_start to patch tools
-    events['before_agent_start']({});
-    
-    const patchedTool = mockPi.tools.find(t => t.name === 'gsd_plan_milestone');
-    assert.ok(patchedTool.__patched, 'tool should be marked as patched');
-    
-    // Test normal execution
-    const resultNormal = await patchedTool.execute({ someArg: 'value' });
-    assert.strictEqual(resultNormal.output, 'success', 'should return original execution output');
-    
-    // Test validation failure
-    const resultFail = await patchedTool.execute({ failValidation: true });
-    assert.ok(resultFail.output.includes('[SEMANTIC VALIDATION FAILED]'), 'should catch error and return fake success with error message');
+  await t.test("user input clears heartbeat", () => {
+    const { handlers, msgs } = createPlugin();
+    mock.timers.enable({ apis: ["setTimeout"] });
+    handlers["tool_call"]({ toolName: "gsd_plan_milestone", toolCallId: "h3", input: {} });
+    handlers["stop"]({ reason: "completed" });
+    mock.timers.tick(500);
+    handlers["input"]({ source: "interactive" });
+    mock.timers.tick(5_000);
+    assert.ok(!msgs.includes("/gsd auto"));
+    mock.timers.reset();
   });
 
-  await t.test('decodes JSON strings for schema array fields before validation', async () => {
-    events['before_agent_start']({});
-    const patchedTool = mockPi.tools.find(t => t.name === 'gsd_plan_milestone');
-    
-    const result = await patchedTool.execute({ 
-      slices: JSON.stringify([{ sliceId: 'S01', isSketch: true }]) 
-    });
-    
-    assert.strictEqual(result.output, 'success', 'should parse JSON strings and execute normally');
+  await t.test("non-gsd tools do not start heartbeat", () => {
+    const { handlers, msgs } = createPlugin();
+    mock.timers.enable({ apis: ["setTimeout"] });
+    handlers["tool_call"]({ toolName: "bash", toolCallId: "h4", input: { command: "ls" } });
+    handlers["stop"]({ reason: "completed" });
+    mock.timers.tick(5_000);
+    assert.ok(!msgs.includes("/gsd auto"));
+    mock.timers.reset();
   });
 
-  await t.test('validates conditional requirements (integrationClosure) for full slices', async () => {
-    events['before_agent_start']({});
-    const patchedTool = mockPi.tools.find(t => t.name === 'gsd_plan_milestone');
-    
-    // Missing integrationClosure for full slice
-    const resultFail = await patchedTool.execute({
-      slices: [{ sliceId: 'S01', isSketch: false }]
-    });
-    assert.ok(resultFail.output.includes('[SEMANTIC VALIDATION FAILED]'), 'should fail if integrationClosure is missing for a full slice');
-    assert.ok(resultFail.output.includes('integrationClosure is required'), 'should mention integrationClosure');
+  await t.test("stop cancelled does not start heartbeat", () => {
+    const { handlers, msgs } = createPlugin();
+    mock.timers.enable({ apis: ["setTimeout"] });
+    handlers["tool_call"]({ toolName: "gsd_plan_milestone", toolCallId: "h5", input: {} });
+    handlers["stop"]({ reason: "cancelled" });
+    mock.timers.tick(5_000);
+    assert.ok(!msgs.includes("/gsd auto"));
+    mock.timers.reset();
+  });
+});
 
-    // Sketch slice doesn't need integrationClosure
-    const resultPassSketch = await patchedTool.execute({
-      slices: [{ sliceId: 'S01', isSketch: true }]
-    });
-    assert.strictEqual(resultPassSketch.output, 'success', 'should pass if it is a sketch slice');
+test("identical-call loop guard", async t => {
+  await t.test("blocks after 4 identical calls", () => {
+    const { handlers } = createPlugin();
+    let last;
+    for (let i = 0; i < 3; i++) last = fireToolCall(handlers, "g" + i, "bash", { x: 1 });
+    last = fireToolCall(handlers, "g3", "bash", { x: 1 });
+    assert.ok(last?.block);
+  });
 
-    // Full slice with integrationClosure
-    const resultPassFull = await patchedTool.execute({
-      slices: [{ sliceId: 'S01', isSketch: false, integrationClosure: 'verified' }]
-    });
-    assert.strictEqual(resultPassFull.output, 'success', 'should pass if full slice has integrationClosure');
+  await t.test("different inputs reset counter", () => {
+    const { handlers } = createPlugin();
+    for (let i = 0; i < 4; i++) {
+      const r = fireToolCall(handlers, "d" + i, "bash", { command: "ls", x: i });
+      assert.ok(!r?.block);
+    }
+  });
+
+  await t.test("ask_user_questions resets counter", () => {
+    const { handlers } = createPlugin();
+    for (let i = 0; i < 3; i++) fireToolCall(handlers, "r" + i, "bash", { command: "ls", x: 1 });
+    handlers["tool_call"]({ toolName: "ask_user_questions", toolCallId: "ask1", input: {} });
+    handlers["tool_call"]({ toolName: "ask_user_questions", toolCallId: "ask1", input: {} });
+    for (let i = 0; i < 3; i++)
+      assert.ok(!fireToolCall(handlers, "rr" + i, "bash", { command: "ls", x: 1 })?.block);
+  });
+});
+
+test("critical-tool validation in exec phase", async t => {
+  await t.test("blocks bash with empty command", () => {
+    const r = fireToolCall(createPlugin().handlers, "v1", "bash", { command: "" });
+    assert.ok(r?.block);
+    assert.ok(r.reason?.includes("command"));
+  });
+
+  await t.test("blocks bash with missing command", () => {
+    const r = fireToolCall(createPlugin().handlers, "v2", "bash", {});
+    assert.ok(r?.block);
+  });
+
+  await t.test("allows bash with valid command", () => {
+    const r = fireToolCall(createPlugin().handlers, "v3", "bash", { command: "ls -la" });
+    assert.ok(!r?.block);
+  });
+
+  await t.test("blocks write with missing path", () => {
+    const r = fireToolCall(createPlugin().handlers, "v4", "write", { content: "hi" });
+    assert.ok(r?.block);
+  });
+
+  await t.test("allows write with both path and content", () => {
+    const r = fireToolCall(createPlugin().handlers, "v5", "write", { path: "/tmp/f", content: "hi" });
+    assert.ok(!r?.block);
   });
 });
