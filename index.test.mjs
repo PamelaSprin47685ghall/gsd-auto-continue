@@ -6,12 +6,14 @@ import autoContinue from "./index.js";
 function fakePi() {
   const handlers = {};
   const msgs = [], notes = [];
+  const ctx = {
+    ui: { notify: (m, t) => { notes.push({ m, t }); } },
+  };
   return {
-    handlers, msgs, notes,
+    handlers, msgs, notes, ctx,
     pi: {
       on: (e, h) => { handlers[e] = h; },
       sendUserMessage: m => { msgs.push(m); },
-      ui: { notify: (m, t) => { notes.push({ m, t }); } },
     },
   };
 }
@@ -57,63 +59,63 @@ test("gsd-auto-continue", async t => {
   });
 
   await t.test("stop error triggers with-context retry", () => {
-    const { handlers, msgs } = createPlugin();
+    const { handlers, msgs, ctx } = createPlugin();
     mock.timers.enable({ apis: ["setTimeout"] });
-    handlers["stop"]({ reason: "error" });
+    handlers["stop"]({ reason: "error" }, ctx);
     mock.timers.tick(1_000);
     assert.equal(msgs.length, 1);
     mock.timers.reset();
   });
 
   await t.test("stop completed + gsdSeen starts heartbeat", () => {
-    const { handlers, msgs } = createPlugin();
+    const { handlers, msgs, ctx } = createPlugin();
     mock.timers.enable({ apis: ["setTimeout"] });
     handlers["tool_call"]({ toolName: "gsd_plan_milestone", toolCallId: "h1", input: {} });
-    handlers["stop"]({ reason: "completed" });
+    handlers["stop"]({ reason: "completed" }, ctx);
     mock.timers.tick(5_000);
     assert.ok(msgs.includes("/gsd auto"));
     mock.timers.reset();
   });
 
   await t.test("before_agent_start clears heartbeat", () => {
-    const { handlers, msgs } = createPlugin();
+    const { handlers, msgs, ctx } = createPlugin();
     mock.timers.enable({ apis: ["setTimeout"] });
     handlers["tool_call"]({ toolName: "gsd_plan_milestone", toolCallId: "h2", input: {} });
-    handlers["stop"]({ reason: "completed" });
+    handlers["stop"]({ reason: "completed" }, ctx);
     mock.timers.tick(500);
-    handlers["before_agent_start"]({});
+    handlers["before_agent_start"]({}, ctx);
     mock.timers.tick(5_000);
     assert.ok(!msgs.includes("/gsd auto"));
     mock.timers.reset();
   });
 
   await t.test("user input clears heartbeat", () => {
-    const { handlers, msgs } = createPlugin();
+    const { handlers, msgs, ctx } = createPlugin();
     mock.timers.enable({ apis: ["setTimeout"] });
     handlers["tool_call"]({ toolName: "gsd_plan_milestone", toolCallId: "h3", input: {} });
-    handlers["stop"]({ reason: "completed" });
+    handlers["stop"]({ reason: "completed" }, ctx);
     mock.timers.tick(500);
-    handlers["input"]({ source: "interactive" });
+    handlers["input"]({ source: "interactive" }, ctx);
     mock.timers.tick(5_000);
     assert.ok(!msgs.includes("/gsd auto"));
     mock.timers.reset();
   });
 
   await t.test("non-gsd tools do not start heartbeat", () => {
-    const { handlers, msgs } = createPlugin();
+    const { handlers, msgs, ctx } = createPlugin();
     mock.timers.enable({ apis: ["setTimeout"] });
     handlers["tool_call"]({ toolName: "bash", toolCallId: "h4", input: { command: "ls" } });
-    handlers["stop"]({ reason: "completed" });
+    handlers["stop"]({ reason: "completed" }, ctx);
     mock.timers.tick(5_000);
     assert.ok(!msgs.includes("/gsd auto"));
     mock.timers.reset();
   });
 
   await t.test("stop cancelled does not start heartbeat", () => {
-    const { handlers, msgs } = createPlugin();
+    const { handlers, msgs, ctx } = createPlugin();
     mock.timers.enable({ apis: ["setTimeout"] });
     handlers["tool_call"]({ toolName: "gsd_plan_milestone", toolCallId: "h5", input: {} });
-    handlers["stop"]({ reason: "cancelled" });
+    handlers["stop"]({ reason: "cancelled" }, ctx);
     mock.timers.tick(5_000);
     assert.ok(!msgs.includes("/gsd auto"));
     mock.timers.reset();

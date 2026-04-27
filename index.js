@@ -12,38 +12,40 @@ export default function autoContinuePlugin(pi) {
   const MAX_LOOP = 4, MAX_CTX = 5, MAX_PAUSE = 5;
   let hbTimer = null, gsdSeen = false;
   const execIds = new Set();
+  let capturedCtx = null;
 
   const hbStart = () => {
     clearTimeout(hbTimer);
     hbTimer = setTimeout(() => {
       if (++pauseRetries > MAX_PAUSE) {
-        pi.ui?.notify?.(`Auto-continue: max pause-recovery attempts (${MAX_PAUSE}) reached`, "error");
+        capturedCtx?.ui?.notify?.(`Auto-continue: max pause-recovery attempts (${MAX_PAUSE}) reached`, "error");
         return;
       }
-      pi.ui?.notify?.(`Auto-continue: stalled — resuming (${pauseRetries}/${MAX_PAUSE})`, "info");
+      capturedCtx?.ui?.notify?.(`Auto-continue: stalled — resuming (${pauseRetries}/${MAX_PAUSE})`, "info");
       pi.sendUserMessage("/gsd auto");
     }, 5_000);
   };
 
   const hbClear = () => { clearTimeout(hbTimer); hbTimer = null; };
 
-  pi.on("input", e => { if (e.source === "interactive") hbClear(); });
-  pi.on("before_agent_start", hbClear);
+  pi.on("input", (e, ctx) => { capturedCtx = ctx; if (e.source === "interactive") hbClear(); });
+  pi.on("before_agent_start", (e, ctx) => { capturedCtx = ctx; hbClear(); });
 
-  pi.on("stop", e => {
+  pi.on("stop", (e, ctx) => {
+    capturedCtx = ctx;
     if (e.reason === "completed") {
       if (gsdSeen) hbStart();
       gsdSeen = false;
       ctxRetries = 0;
     } else if (e.reason === "error") {
       if (++ctxRetries > MAX_CTX) {
-        pi.ui?.notify?.(`Auto-continue: giving up after ${MAX_CTX} error retries`, "warning");
+        ctx.ui?.notify?.(`Auto-continue: giving up after ${MAX_CTX} error retries`, "warning");
         ctxRetries = 0;
         return;
       }
       const delay = Math.min(1_000 * 2 ** (ctxRetries - 1), 10_000);
       setTimeout(() => {
-        pi.ui?.notify?.(`Auto-continue: retrying (${ctxRetries}/${MAX_CTX})`, "info");
+        ctx.ui?.notify?.(`Auto-continue: retrying (${ctxRetries}/${MAX_CTX})`, "info");
         pi.sendUserMessage("The previous operation failed. Please analyze the error, fix the arguments, and retry.");
       }, delay);
     }
