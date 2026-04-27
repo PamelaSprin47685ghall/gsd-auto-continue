@@ -1,0 +1,10 @@
+{
+  "id": "auto-continue",
+  "name": "Auto Continue",
+  "version": "1.0.0",
+  "description": "Keeps auto-mode moving after recoverable stops.",
+  "tier": "community",
+  "requires": {
+    "platform": "any"
+  }
+}
